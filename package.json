@@ -1,0 +1,10 @@
+{
+  "name": "gitlab-graph-tests",
+  "private": true,
+  "scripts": {
+    "test": "node test/run.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

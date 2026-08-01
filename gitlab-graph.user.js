@@ -2660,5 +2660,48 @@ html.gl-dark .glg-root {
         await bootstrapData();
     };
 
+    const testHook = globalThis.__GLG_TEST_HOOK__;
+    if (typeof testHook === "function") {
+        testHook({
+            ROW_HEIGHT,
+            LANE_WIDTH,
+            LANE_ORIGIN_X,
+            DOT_RADIUS,
+            LANE_STROKE,
+            MAX_VISIBLE_LANES,
+            GRAPH_FADE_WIDTH,
+            GRAPH_PAD,
+            MIN_GRAPH_WIDTH,
+            PER_PAGE,
+            INITIAL_BATCHES,
+            DIFF_LIMIT,
+            BRANCH_SEARCH_DEBOUNCE_MS,
+            LANE_COLORS,
+            SPINE_LANE,
+            HALF_ROW,
+            formatDateTime,
+            laneColor,
+            laneX,
+            laneDrawX,
+            graphWidth,
+            normalizeCommit,
+            uniqueParents,
+            compareCommits,
+            topoSortCommits,
+            collectMainline,
+            collectReachable,
+            assignLanes,
+            transitionUpperPath,
+            transitionLowerPath,
+            halfRowPath,
+            buildGraphSegments,
+            buildRowGraph,
+            buildDetailGraph,
+            parseContext,
+            sha1Hex,
+            state,
+        });
+    }
+
     void main();
 })();
