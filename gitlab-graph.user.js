@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.1.4
+// @version      0.1.5
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -1347,8 +1347,8 @@ html.gl-dark .glg-root {
                 }
             }
 
-            // 詳細パネル行に引き伸ばす縦線。遷移中のレーンは分割点 (中点) の x に置くと
-            // 上下の半カーブとぴったり繋がる
+            // 詳細パネル行に引き伸ばす縦線。この行の下端境界を通過する全レーンを描く。
+            // 遷移中のレーンだけは分割点 (中点) の x に置くと上下の半カーブとぴったり繋がる
             const midByLane = new Map();
             for (const entry of asTop[index]) {
                 midByLane.set(entry.laneIndex, (startX(entry) + endX(entry)) / 2);
@@ -1356,7 +1356,15 @@ html.gl-dark .glg-root {
             const detailLanes = [];
             const detailDrawn = new Set();
             for (const laneIndex of row.activeAfter) {
-                const x = midByLane.get(laneIndex) ?? laneDrawX(laneIndex);
+                const mid = midByLane.get(laneIndex);
+                if (mid !== undefined) {
+                    // 分割点は隣のレーンの中心と一致することがある (レーン 0 -> 2 の中点 = レーン 1 の中心)。
+                    // x で重複除外すると通過レーンの線が消えるので、遷移中のレーンは必ず描く
+                    detailLanes.push({ x: mid, color: laneColor(laneIndex) });
+                    continue;
+                }
+                const x = laneDrawX(laneIndex);
+                // 切り詰めで同じ x に潰れたレーンだけをまとめる
                 if (detailDrawn.has(x)) continue;
                 detailDrawn.add(x);
                 detailLanes.push({ x, color: laneColor(laneIndex) });
