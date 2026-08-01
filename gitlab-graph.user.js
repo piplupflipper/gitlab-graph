@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.1.2
+// @version      0.1.3
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -1229,6 +1229,19 @@ html.gl-dark .glg-root {
         const line = (x1, y1, x2, y2, color) =>
             svgEl("line", { x1, y1, x2, y2, stroke: color, "stroke-width": LANE_STROKE, "stroke-linecap": "round" });
 
+        // レーン間の遷移は三次ベジェで描く。制御点を両端と同じ x・区間の中点の y に置くと
+        // 両端の接線が垂直になり、上下の縦線と折れ目なく繋がる S 字になる (Git Graph と同じ描き方)
+        const curve = (x0, y0, x1, y1, color) => {
+            const controlY = (y0 + y1) / 2;
+            return svgEl("path", {
+                d: `M ${x0} ${y0} C ${x0} ${controlY}, ${x1} ${controlY}, ${x1} ${y1}`,
+                fill: "none",
+                stroke: color,
+                "stroke-width": LANE_STROKE,
+                "stroke-linecap": "round",
+            });
+        };
+
         // 切り詰めると複数のレーンが同じ x に重なるので、縦線は 1 本だけ描く
         const drawnVerticals = new Set();
 
@@ -1248,28 +1261,12 @@ html.gl-dark .glg-root {
 
         // 合流: 相手レーンの上端からドットへ。線の色は元のレーンのもの
         for (const index of row.merges) {
-            const from = laneDrawX(index);
-            svg.appendChild(
-                svgEl("path", {
-                    d: `M ${from} 0 C ${from} ${midY * 0.7}, ${dotX} ${midY * 0.3}, ${dotX} ${midY}`,
-                    fill: "none",
-                    stroke: laneColor(index),
-                    "stroke-width": LANE_STROKE,
-                }),
-            );
+            svg.appendChild(curve(laneDrawX(index), 0, dotX, midY, laneColor(index)));
         }
 
         // 分岐 (マージコミットの第 2 親以降): ドットから相手レーンの下端へ
         for (const index of row.branches) {
-            const to = laneDrawX(index);
-            svg.appendChild(
-                svgEl("path", {
-                    d: `M ${dotX} ${midY} C ${dotX} ${midY * 1.3}, ${to} ${midY * 1.7}, ${to} ${ROW_HEIGHT}`,
-                    fill: "none",
-                    stroke: laneColor(index),
-                    "stroke-width": LANE_STROKE,
-                }),
-            );
+            svg.appendChild(curve(dotX, midY, laneDrawX(index), ROW_HEIGHT, laneColor(index)));
         }
 
         const dot = svgEl("circle", {

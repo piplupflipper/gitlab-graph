@@ -44,7 +44,7 @@ https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.
 
 | 列 | 内容 |
 |---|---|
-| Graph | 🕸️ レーンの縦線・コミットのドット・合流/分岐のカーブ |
+| Graph | 🕸️ レーンの縦線・コミットのドット・合流/分岐のベジェ曲線 |
 | Description | 🏷️ ブランチ/タグのチップ + コミットタイトル |
 | Author | 👤 20px の丸アバター + author 名 |
 | Date | 🕒 コミット日時 (`YYYY-MM-DD HH:mm`、ローカルタイム) |
@@ -388,6 +388,10 @@ localStorage はプライベートモードなどで例外を投げることが�
 この縦線は `height="100%"` の `rect` で描いており、パネルの高さが変わっても線幅が歪まない。📐
 `rect` の中心 (`x + width / 2`) は通常行の `line` の中心 (`x1`) と一致させる。線の太さは両者で同じ定数を使う。
 
+レーンをまたぐ遷移 (合流・分岐) は折れ線ではなく三次ベジェで描く。🎢
+`M x0 y0 C x0 ym, x1 ym, x1 y1` (`ym` は区間の中点) の形にすると、制御点の x が両端と同じになるので**両端の接線が垂直**になり、上下の縦線と折れ目なく繋がる S 字カーブになる (VS Code の Git Graph 拡張と同じ描き方)。
+遷移はどれも半行分 (行上端 → ドット中心、またはドット中心 → 行下端) なので、`ym` はその半行の中点。`fill="none"` を忘れると path が塗り潰される。⚠️
+
 グラフのセルの `padding: 0` は、`.glg-table td { padding: 0 8px }` に詳細度で負けないよう `td` を含めた選択子で書く。⚠️
 負けると、通常行の SVG は左 padding の後ろから流れる一方、詳細行の SVG は絶対配置で padding box の左端に貼り付くため、**詳細行の縦線だけが 8px 左にずれる**。
 コミットを選ぶと詳細パネルが開くので「選択するとグラフのインデントがずれる」という形で現れた (2026-08-01 に gitlab.com と GitLab 17.5 の CSS を使ったローカル再現の両方で確認)。
@@ -437,4 +441,4 @@ CSS は `<style>` で注入し、class 名は `glg-` で始める。🏷️
 ---
 
 リポジトリ: [ngmtine/gitlab-graph](https://github.com/ngmtine/gitlab-graph)
-本 README の記述は 2026-08-01 時点の gitlab.com と gitlab-graph 0.1.2 に基づく。
+本 README の記述は 2026-08-01 時点の gitlab.com と gitlab-graph 0.1.3 に基づく。
