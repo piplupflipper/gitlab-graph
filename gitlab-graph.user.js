@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.1.5
+// @version      0.2.0
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -13,6 +13,8 @@
 
 (() => {
     "use strict";
+
+    const VERSION = "0.2.0";
 
     // ---------------------------------------------------------------------
     // 定数
@@ -49,6 +51,8 @@
     const MIN_GRAPH_WIDTH = 56;
 
     const PER_PAGE = 100;
+    /** branches / tags 一覧を読み切る最大ページ数 */
+    const REF_PAGE_LIMIT = 10;
     /** 初回に直列で取得する回数 (全ブランチモードなら日時窓 3 回、ref_name モードなら 3 ページ) */
     const INITIAL_BATCHES = 3;
     /** diff API の取得上限。これを超える変更ファイルは省略する */
@@ -118,12 +122,18 @@
         until: "",
         hasMore: true,
         loading: false,
+        /** コミット取得の世代。ref 切替前の応答を現在の state に混ぜない */
+        commitGeneration: 0,
 
-        /** チップ用。branches API の 1 ページ目 (絞り込みなし) */
+        /** チップと到達可能性の起点に使う、ページング済みの ref 一覧 */
         branches: [],
         tags: [],
         /** datalist の候補にするブランチ名。ブランチ検索のたびに入れ替わる */
         branchOptions: [],
+        /** branches / tags の両方を最後のページまで取得できたか */
+        refsComplete: false,
+        /** 不完全な ref 一覧を理由に到達可能性フィルタを自動無効化した理由 */
+        refFilterReason: "",
         /** sha -> [{ type, name, isDefault }] */
         refsBySha: new Map(),
         /** 幹 (mainline) の先端 sha。空なら幹なしで描く */
@@ -196,6 +206,7 @@
     let pendingYAt = 0;
     let branchSearchTimer = 0;
     let branchSearchController = null;
+    let commitController = null;
 
     class ApiError extends Error {
         constructor(status) {
@@ -875,29 +886,34 @@ html.gl-dark .glg-root {
     const fetchBranch = (name) => fetchJson(projectApi(`/repository/branches/${encodeURIComponent(name)}`, null));
 
     // search を付けるとサーバ側で絞り込める。付けないとアルファベット順の先頭 100 件しか見えない
-    const fetchBranches = (search, signal) => {
+    const fetchBranches = (search, signal, page) => {
         const params = { per_page: String(PER_PAGE) };
         if (search) params.search = search;
+        if (page) params.page = String(page);
         return fetchJson(projectApi("/repository/branches", params), signal);
     };
 
-    const fetchTags = () => fetchJson(projectApi("/repository/tags", { per_page: String(PER_PAGE) }));
+    const fetchTags = (page, signal) =>
+        fetchJson(
+            projectApi("/repository/tags", { per_page: String(PER_PAGE), page: String(page) }),
+            signal,
+        );
 
     // all=true では page が無視され、page=1 と page=2 が同一の 100 件を返す
     // (2026-08-01 に gitlab.com の gitlab-org/gitlab-foss で実測)。
     // そのため全ブランチモードは page ではなく until (コミット日時) で窓をずらして継ぎ足す。
     // ref_name 指定なら page ベースのページングは正常に機能するので、そちらは page を使う。
     // 並びはどのモードでもクライアント側で組み直すので、サーバ側の並び替えは要求しない。
-    const fetchCommitBatch = () => {
+    const fetchCommitBatch = (request, signal) => {
         const params = { per_page: String(PER_PAGE) };
-        if (state.mode === "ref") {
-            params.ref_name = state.refName;
-            params.page = String(state.nextPage);
+        if (request.mode === "ref") {
+            params.ref_name = request.refName;
+            params.page = String(request.nextPage);
         } else {
             params.all = "true";
-            if (state.until) params.until = state.until;
+            if (request.until) params.until = request.until;
         }
-        return fetchJson(projectApi("/repository/commits", params));
+        return fetchJson(projectApi("/repository/commits", params), signal);
     };
 
     const fetchCommitDetail = (sha) => fetchJson(projectApi(`/repository/commits/${encodeURIComponent(sha)}`, null));
@@ -980,17 +996,35 @@ html.gl-dark .glg-root {
             }
         }
 
-        // ready は committed_date 降順を保つ。同時に ready になったものは新しい方を先に出す
+        // ready は compareCommits を優先度にした二分ヒープにする。
+        // 配列の先頭削除・途中挿入による最悪 O(n²) を避けつつ、従来と同じ順序で取り出す
         const ready = [];
         const pushReady = (commit) => {
-            let low = 0;
-            let high = ready.length;
-            while (low < high) {
-                const mid = (low + high) >> 1;
-                if (compareCommits(commit, ready[mid]) < 0) high = mid;
-                else low = mid + 1;
+            ready.push(commit);
+            let index = ready.length - 1;
+            while (index > 0) {
+                const parent = (index - 1) >> 1;
+                if (compareCommits(ready[parent], ready[index]) <= 0) break;
+                [ready[parent], ready[index]] = [ready[index], ready[parent]];
+                index = parent;
             }
-            ready.splice(low, 0, commit);
+        };
+        const popReady = () => {
+            const first = ready[0];
+            const last = ready.pop();
+            if (ready.length === 0) return first;
+            ready[0] = last;
+            let index = 0;
+            while (true) {
+                const left = index * 2 + 1;
+                if (left >= ready.length) break;
+                const right = left + 1;
+                const best = right < ready.length && compareCommits(ready[right], ready[left]) < 0 ? right : left;
+                if (compareCommits(ready[index], ready[best]) <= 0) break;
+                [ready[index], ready[best]] = [ready[best], ready[index]];
+                index = best;
+            }
+            return first;
         };
 
         for (const commit of commits) {
@@ -999,7 +1033,7 @@ html.gl-dark .glg-root {
 
         const ordered = [];
         while (ready.length > 0) {
-            const commit = ready.shift();
+            const commit = popReady();
             ordered.push(commit);
             for (const parent of uniqueParents(commit.parents)) {
                 if (!childCount.has(parent)) continue;
@@ -1859,7 +1893,30 @@ html.gl-dark .glg-root {
         ui.status.textContent = "";
         if (state.statusText) ui.status.appendChild(el("div", null, state.statusText));
         if (state.notice) ui.status.appendChild(el("div", "glg-status-note", state.notice));
+        if (state.refFilterReason) {
+            ui.status.appendChild(
+                el(
+                    "div",
+                    "glg-status-note glg-ref-filter-note",
+                    `MR の一時コミットの到達可能性フィルタを自動的に無効化した (${state.refFilterReason})`,
+                ),
+            );
+        }
         for (const entry of state.errors) ui.status.appendChild(el("div", "glg-status-error", entry.message));
+        syncDiagnostics();
+    };
+
+    const syncDiagnostics = () => {
+        const dataset = document.documentElement.dataset;
+        dataset.glgVersion = VERSION;
+        dataset.glgMode = state.mode;
+        dataset.glgRef = state.mode === "ref" ? state.refName : state.ref;
+        dataset.glgLoaded = String(state.commits.length);
+        dataset.glgVisible = String(state.visibleRows.length);
+        dataset.glgHidden = String(state.hiddenCount);
+        dataset.glgLanes = String(state.laneCount);
+        dataset.glgGeneration = String(state.commitGeneration);
+        dataset.glgLastError = state.errors.at(-1)?.source ?? "";
     };
 
     const renderCount = () => {
@@ -1963,11 +2020,11 @@ html.gl-dark .glg-root {
     /**
      * 表示対象のコミットを決める。
      * ref_name モードはサーバ側がその ref の履歴しか返さないのでフィルタしない。
-     * 起点 (branches / tags / 幹) がまだ 1 つも届いていない間は、暫定的に全件表示する。
+     * ref 一覧が完全に取得できない場合は、実在するコミットを誤って隠さないよう全件表示する。
      */
     const visibleCommits = () => {
         state.hiddenCount = 0;
-        if (!state.hidePhantom || state.mode === "ref") return state.commits;
+        if (!state.hidePhantom || state.mode === "ref" || !state.refsComplete) return state.commits;
 
         const roots = refTipShas();
         if (roots.length === 0) return state.commits;
@@ -2046,19 +2103,31 @@ html.gl-dark .glg-root {
 
     /** 全ブランチモードなら日時窓を、ref_name モードならページを batchCount 回ぶん直列に進める */
     const loadCommits = async (batchCount) => {
+        const generation = state.commitGeneration;
+        const request = {
+            mode: state.mode,
+            refName: state.refName,
+            nextPage: state.nextPage,
+            until: state.until,
+        };
+        const controller = new AbortController();
+        commitController = controller;
         state.loading = true;
         state.notice = "";
         renderCount();
 
         try {
             for (let i = 0; i < batchCount; i += 1) {
-                if (!state.hasMore) break;
-                const payload = await fetchCommitBatch();
+                if (generation !== state.commitGeneration || !state.hasMore) break;
+                const payload = await fetchCommitBatch(request, controller.signal);
+                // fetch が AbortSignal を無視する実装でも、旧世代の応答は state に適用しない
+                if (generation !== state.commitGeneration || controller.signal.aborted) return;
                 const received = Array.isArray(payload) ? payload.length : 0;
                 const added = appendCommits(payload);
 
-                if (state.mode === "ref") {
-                    state.nextPage += 1;
+                if (request.mode === "ref") {
+                    request.nextPage += 1;
+                    state.nextPage = request.nextPage;
                     if (received < PER_PAGE) {
                         state.hasMore = false;
                         break;
@@ -2077,22 +2146,29 @@ html.gl-dark .glg-root {
                     state.hasMore = false;
                     break;
                 }
-                state.until = oldestLoadedDate();
+                request.until = oldestLoadedDate();
+                state.until = request.until;
             }
         } catch (error) {
+            if (generation !== state.commitGeneration || controller.signal.aborted) return;
             pushError("commits", `コミットの取得に失敗した (${describeError(error)})`);
             state.hasMore = false;
         } finally {
-            state.loading = false;
-            state.statusText = "";
+            if (generation === state.commitGeneration) {
+                state.loading = false;
+                state.statusText = "";
+                if (commitController === controller) commitController = null;
+            }
         }
+
+        if (generation !== state.commitGeneration) return;
 
         // 存在しない ref_name に対して、GitLab は 404 ではなく空配列を返すことがある。
         // その場合エラーが 1 つも積まれないまま 0 行になり、綴り間違いに気づけないので明示する
-        if (state.mode === "ref" && state.commits.length === 0 && !hasError("commits")) {
+        if (request.mode === "ref" && state.commits.length === 0 && !hasError("commits")) {
             pushError(
                 "commits",
-                `ブランチ "${state.refName}" のコミットが 0 件だった (ブランチ名が正しいか、アクセス権があるか確認)`,
+                `ブランチ "${request.refName}" のコミットが 0 件だった (ブランチ名が正しいか、アクセス権があるか確認)`,
             );
         }
 
@@ -2101,6 +2177,10 @@ html.gl-dark .glg-root {
     };
 
     const resetCommits = () => {
+        state.commitGeneration += 1;
+        if (commitController) commitController.abort();
+        commitController = null;
+        state.loading = false;
         state.commits = [];
         state.loadedShas = new Set();
         state.nextPage = 1;
@@ -2112,6 +2192,7 @@ html.gl-dark .glg-root {
         state.selectedSha = "";
         state.expandedSha = "";
         state.mainlineTip = "";
+        state.mainlineToken += 1;
         // 消すのはコミット取得のエラーだけ。プロジェクト情報や ref 一覧のエラーは残す
         clearErrors("commits");
     };
@@ -2155,22 +2236,49 @@ html.gl-dark .glg-root {
         await loadCommits(INITIAL_BATCHES);
     };
 
+    const fetchRefPages = async (fetchPage) => {
+        const items = [];
+        let firstPage = [];
+        for (let page = 1; page <= REF_PAGE_LIMIT; page += 1) {
+            let payload;
+            try {
+                payload = await fetchPage(page);
+                if (!Array.isArray(payload)) throw new Error("一覧 API の応答が配列ではなかった");
+            } catch (error) {
+                // 到達可能性には使えなくても、取得済みページのチップと候補は残す
+                return { items, firstPage, complete: false, error };
+            }
+            if (page === 1) firstPage = payload;
+            items.push(...payload);
+            if (payload.length < PER_PAGE) return { items, firstPage, complete: true, error: null };
+        }
+        return { items, firstPage, complete: false, error: null };
+    };
+
     const loadRefs = async () => {
         clearErrors("refs");
-        const [branchResult, tagResult] = await Promise.allSettled([fetchBranches("", undefined), fetchTags()]);
+        state.refsComplete = false;
+        state.refFilterReason = "";
+        const [branchResult, tagResult] = await Promise.all([
+            fetchRefPages((page) => fetchBranches("", undefined, page)),
+            fetchRefPages((page) => fetchTags(page, undefined)),
+        ]);
 
-        if (branchResult.status === "fulfilled" && Array.isArray(branchResult.value)) {
-            state.branches = branchResult.value;
-            state.branchOptions = state.branches.map((branch) => branch.name).filter(Boolean);
-        } else if (branchResult.status === "rejected") {
-            pushError("refs", `ブランチ一覧の取得に失敗した (${describeError(branchResult.reason)})`);
+        state.branches = branchResult.items;
+        state.branchOptions = branchResult.firstPage.map((branch) => branch.name).filter(Boolean);
+        state.tags = tagResult.items;
+        if (branchResult.error) {
+            pushError("refs", `ブランチ一覧の取得に失敗した (${describeError(branchResult.error)})`);
+        }
+        if (tagResult.error) {
+            pushError("refs", `タグ一覧の取得に失敗した (${describeError(tagResult.error)})`);
         }
 
-        if (tagResult.status === "fulfilled" && Array.isArray(tagResult.value)) {
-            state.tags = tagResult.value;
-        } else if (tagResult.status === "rejected") {
-            pushError("refs", `タグ一覧の取得に失敗した (${describeError(tagResult.reason)})`);
-        }
+        const failed = Boolean(branchResult.error || tagResult.error);
+        const limited = (!branchResult.complete && !branchResult.error) || (!tagResult.complete && !tagResult.error);
+        state.refsComplete = !failed && !limited;
+        if (failed) state.refFilterReason = "ref 一覧の取得に失敗したため";
+        else if (limited) state.refFilterReason = `${REF_PAGE_LIMIT} ページの取得上限を超えたため`;
 
         rebuildRefs();
         renderBranchOptions();
@@ -2663,6 +2771,7 @@ html.gl-dark .glg-root {
     const testHook = globalThis.__GLG_TEST_HOOK__;
     if (typeof testHook === "function") {
         testHook({
+            VERSION,
             ROW_HEIGHT,
             LANE_WIDTH,
             LANE_ORIGIN_X,
@@ -2673,6 +2782,7 @@ html.gl-dark .glg-root {
             GRAPH_PAD,
             MIN_GRAPH_WIDTH,
             PER_PAGE,
+            REF_PAGE_LIMIT,
             INITIAL_BATCHES,
             DIFF_LIMIT,
             BRANCH_SEARCH_DEBOUNCE_MS,

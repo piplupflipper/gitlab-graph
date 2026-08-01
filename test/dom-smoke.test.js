@@ -10,6 +10,7 @@ const {
     loadCore,
     rawCommit,
     response,
+    source,
     tick,
     waitFor,
 } = require("./helpers");
@@ -616,7 +617,9 @@ const searchEnv = () => {
             }
             if (url.pathname.endsWith("/repository/branches")) {
                 const search = url.searchParams.get("search");
-                return response(search ? fixture.branches.filter((entry) => entry.name.includes(search)) : fixture.branches.slice(0, 100));
+                const matches = search ? fixture.branches.filter((entry) => entry.name.includes(search)) : fixture.branches;
+                const page = Number(url.searchParams.get("page") ?? 1);
+                return response(matches.slice((page - 1) * 100, page * 100));
             }
         };
         searchPromise = createDom({ fixture });
@@ -815,5 +818,175 @@ test("dom-smoke 98: phantom filter hides unreachable commits and can be disabled
     toggle.dispatchEvent(new env.window.Event("change", { bubbles: true }));
     assert.ok(env.document.querySelector('.glg-row[data-glg-sha="phantom0"]'));
     assert.strictEqual(env.window.localStorage.getItem("glg-hide-phantom"), "0");
+    env.dom.window.close();
+});
+
+test("dom-smoke 99: branch switch aborts an old all-mode request and rejects its late response", async () => {
+    let resolveOld;
+    let oldSignal;
+    const fixture = {
+        project: { default_branch: "main" },
+        branches: [
+            { name: "main", default: true, commit: { id: "old00000" } },
+            { name: "dev", default: false, commit: { id: "new00000" } },
+        ],
+        tags: [],
+        commits: [],
+        fetch: (url, options) => {
+            if (!url.pathname.endsWith("/repository/commits")) return undefined;
+            if (url.searchParams.get("all") === "true") {
+                oldSignal = options.signal;
+                return new Promise((resolve) => {
+                    resolveOld = () => resolve(response([rawCommit("old00000", [], 1)]));
+                });
+            }
+            if (url.searchParams.get("ref_name") === "dev") {
+                return response([rawCommit("new00000", [], 2)]);
+            }
+            return response([]);
+        },
+    };
+    const env = await createDom({ fixture, waitForUi: false });
+    await waitFor(() => env.document.querySelector(".glg-root") && resolveOld, "delayed all-mode request");
+    const generation = env.api.state.commitGeneration;
+    const input = env.document.querySelector(".glg-branch");
+    input.value = "dev";
+    dispatchKey(env.window, input, "Enter");
+    await waitFor(() => env.api.state.commits.some((item) => item.sha === "new00000"), "new ref response");
+    assert.ok(oldSignal.aborted);
+    assert.ok(env.api.state.commitGeneration > generation);
+    resolveOld();
+    await tick();
+    await tick();
+    assert.strictEqual(env.api.state.commits.map((item) => item.sha).join(","), "new00000");
+    assert.strictEqual(env.document.documentElement.dataset.glgMode, "ref");
+    assert.strictEqual(env.document.documentElement.dataset.glgRef, "dev");
+    assert.strictEqual(env.document.documentElement.dataset.glgGeneration, String(env.api.state.commitGeneration));
+    env.dom.window.close();
+});
+
+test("dom-smoke 100: complete two-page branch refs keep page-two commits and filter phantoms", async () => {
+    const main = { name: "main", default: true, commit: { id: "main0000" } };
+    const fillers = Array.from({ length: 99 }, (_, index) => ({
+        name: `branch-${String(index).padStart(3, "0")}`,
+        default: false,
+        commit: { id: "main0000" },
+    }));
+    const late = { name: "zz-late", default: false, commit: { id: "late0000" } };
+    const fixture = {
+        project: { default_branch: "main" },
+        branches: [main, ...fillers, late],
+        tags: [],
+        commits: [rawCommit("main0000", [], 3), rawCommit("late0000", [], 2), rawCommit("phantom0", [], 1)],
+    };
+    const env = await createDom({ fixture });
+    const pages = env.fetch.calls
+        .filter((call) => call.url.pathname.endsWith("/repository/branches") && !call.url.searchParams.has("search"))
+        .map((call) => call.url.searchParams.get("page"));
+    assert.deepStrictEqual(pages, ["1", "2"]);
+    assert.strictEqual(env.api.state.refsComplete, true);
+    assert.ok(env.document.querySelector('.glg-row[data-glg-sha="late0000"]'));
+    assert.strictEqual(env.document.querySelector('.glg-row[data-glg-sha="phantom0"]'), null);
+    assert.match(env.document.querySelector(".glg-count").textContent, /1 件を非表示/);
+    env.dom.window.close();
+});
+
+test("dom-smoke 101: a full tenth branch page fails open with an automatic-disable notice", async () => {
+    const branches = Array.from({ length: 1100 }, (_, index) => ({
+        name: index === 0 ? "main" : `branch-${String(index).padStart(4, "0")}`,
+        default: index === 0,
+        commit: { id: "main0000" },
+    }));
+    const fixture = {
+        project: { default_branch: "main" },
+        branches,
+        tags: [],
+        commits: [rawCommit("main0000", [], 2), rawCommit("phantom0", [], 1)],
+    };
+    const env = await createDom({ fixture });
+    const pages = env.fetch.calls.filter((call) => call.url.pathname.endsWith("/repository/branches") && !call.url.searchParams.has("search"));
+    assert.strictEqual(pages.length, 10);
+    assert.strictEqual(pages.at(-1).url.searchParams.get("page"), "10");
+    assert.strictEqual(env.api.state.refsComplete, false);
+    assert.ok(env.document.querySelector('.glg-row[data-glg-sha="phantom0"]'));
+    assert.ok(env.document.querySelector(".glg-phantom").checked);
+    assert.match(env.document.querySelector(".glg-ref-filter-note").textContent, /自動的に無効化.*10 ページ/);
+    env.dom.window.close();
+});
+
+test("dom-smoke 102: a branches API failure fails open and identifies refs as the last error", async () => {
+    const branches = [
+        { name: "main", default: true, commit: { id: "main0000" } },
+        ...Array.from({ length: 100 }, (_, index) => ({
+            name: `branch-${String(index).padStart(3, "0")}`,
+            default: false,
+            commit: { id: "main0000" },
+        })),
+    ];
+    const fixture = {
+        project: { default_branch: "main" },
+        branches,
+        tags: [],
+        commits: [rawCommit("main0000", [], 2), rawCommit("phantom0", [], 1)],
+        fetch: (url) =>
+            url.pathname.endsWith("/repository/branches") && url.searchParams.get("page") === "2"
+                ? response({}, 500)
+                : undefined,
+    };
+    const env = await createDom({ fixture });
+    assert.strictEqual(env.api.state.refsComplete, false);
+    assert.ok(env.document.querySelector('.glg-row[data-glg-sha="phantom0"]'));
+    assert.match(env.document.querySelector(".glg-ref-filter-note").textContent, /自動的に無効化.*取得に失敗/);
+    assert.match(env.document.querySelector(".glg-status-error").textContent, /HTTP 500/);
+    assert.strictEqual(env.document.documentElement.dataset.glgLastError, "refs");
+    assert.strictEqual(env.document.querySelector("#glg-branch-list option").value, "main");
+    assert.ok(env.document.querySelector('.glg-row[data-glg-sha="main0000"] .glg-chip'));
+    env.dom.window.close();
+});
+
+test("dom-smoke 103: diagnostic dataset mirrors every public runtime field", async () => {
+    const fixture = defaultFixture();
+    fixture.commits.push(rawCommit("phantom0", [], 20));
+    const env = await createDom({ fixture });
+    const data = env.document.documentElement.dataset;
+    assert.deepStrictEqual(
+        {
+            version: data.glgVersion,
+            mode: data.glgMode,
+            ref: data.glgRef,
+            loaded: data.glgLoaded,
+            visible: data.glgVisible,
+            hidden: data.glgHidden,
+            lanes: data.glgLanes,
+            generation: data.glgGeneration,
+            lastError: data.glgLastError,
+        },
+        {
+            version: env.api.VERSION,
+            mode: env.api.state.mode,
+            ref: env.api.state.ref,
+            loaded: String(env.api.state.commits.length),
+            visible: String(env.api.state.visibleRows.length),
+            hidden: String(env.api.state.hiddenCount),
+            lanes: String(env.api.state.laneCount),
+            generation: String(env.api.state.commitGeneration),
+            lastError: "",
+        },
+    );
+    const filter = env.document.querySelector(".glg-filter");
+    filter.value = "Initial";
+    filter.dispatchEvent(new env.window.Event("input", { bubbles: true }));
+    assert.strictEqual(data.glgVisible, "1");
+    const toggle = env.document.querySelector(".glg-phantom");
+    toggle.checked = false;
+    toggle.dispatchEvent(new env.window.Event("change", { bubbles: true }));
+    assert.strictEqual(data.glgHidden, "0");
+    env.dom.window.close();
+});
+
+test("dom-smoke 104: VERSION constant exactly matches userscript metadata", () => {
+    const env = loadCore();
+    const metadata = source.match(/^\/\/ @version\s+(\S+)$/m)?.[1];
+    assert.strictEqual(env.api.VERSION, metadata);
     env.dom.window.close();
 });

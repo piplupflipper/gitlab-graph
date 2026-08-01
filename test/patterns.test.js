@@ -231,3 +231,21 @@ for (let seed = 1; seed <= 20; seed += 1) {
         if (seed === 20) dom.window.close();
     });
 }
+
+test("patterns performance: 5000-commit DAG topology, lanes, and transitions finish within 2 seconds", () => {
+    const values = [];
+    for (let index = 0; index < 5000; index += 1) {
+        const parents = index === 0 ? [] : [`perf-${index - 1}`];
+        if (index >= 8 && index % 11 === 0) parents.push(`perf-${index - 8}`);
+        values.push(commit(`perf-${index}`, parents, index));
+    }
+    const input = shuffle(values, 5000);
+    const started = performance.now();
+    const ordered = api.topoSortCommits(input);
+    const result = api.assignLanes(ordered, api.collectMainline(ordered, "perf-4999"));
+    api.state.laneCount = result.laneCount;
+    api.buildGraphSegments(result.rows);
+    const elapsed = performance.now() - started;
+    assert.strictEqual(result.rows.length, 5000);
+    assert.ok(elapsed < 2000, `5000-commit graph took ${elapsed.toFixed(1)}ms`);
+});

@@ -111,9 +111,14 @@ const createFetchStub = (fixture = defaultFixture()) => {
         }
         if (pathname.endsWith("/repository/branches")) {
             const search = url.searchParams.get("search");
-            return response(search ? fixture.branches.filter((entry) => entry.name.includes(search)) : fixture.branches);
+            const matches = search ? fixture.branches.filter((entry) => entry.name.includes(search)) : fixture.branches;
+            const page = Number(url.searchParams.get("page") ?? 1);
+            return response(matches.slice((page - 1) * 100, page * 100));
         }
-        if (pathname.endsWith("/repository/tags")) return response(fixture.tags);
+        if (pathname.endsWith("/repository/tags")) {
+            const page = Number(url.searchParams.get("page") ?? 1);
+            return response(fixture.tags.slice((page - 1) * 100, page * 100));
+        }
         if (pathname.endsWith("/repository/commits")) return response(fixture.commits);
         if (/\/api\/v4\/projects\/[^/]+$/.test(pathname)) return response(fixture.project);
         throw new Error(`Unhandled fetch: ${url}`);
