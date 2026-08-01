@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.1.0
+// @version      0.1.1
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -53,6 +53,17 @@
     const Y_SEQUENCE_MS = 600;
     /** ブランチ候補の検索を投げるまでの待ち時間 (ms) */
     const BRANCH_SEARCH_DEBOUNCE_MS = 250;
+
+    /** 表示に使うアバターの直径 (px)。行の高さ 26px を崩さない大きさ */
+    const AVATAR_PX = 20;
+    /** API に要求するアバターのサイズ。高 DPI 用に表示の 2 倍以上を取る */
+    const AVATAR_REQUEST_SIZE = 48;
+    /** アバター取得の同時実行数 */
+    const AVATAR_CONCURRENCY = 4;
+
+    const STORAGE_FULL_WIDTH = "glg-full-width";
+    const STORAGE_VIEW_MODE = "glg-view-mode";
+    const STORAGE_HIDE_PHANTOM = "glg-hide-phantom";
     const TOAST_MS = 2000;
 
     // ライト/ダークのどちらの背景でも判読できる中間トーンで揃える。
@@ -108,6 +119,10 @@
         branchOptions: [],
         /** sha -> [{ type, name, isDefault }] */
         refsBySha: new Map(),
+        /** 幹 (mainline) の先端 sha。空なら幹なしで描く */
+        mainlineTip: "",
+        /** 幹の取得世代。切り替え中に遅れて届いた応答を捨てるための目印 */
+        mainlineToken: 0,
 
         /** assignLanes の結果 */
         graphRows: [],
@@ -133,6 +148,19 @@
 
         nativeMode: false,
         nativeRoot: null,
+        /** GitLab のコンテンツ幅制限を外しているか */
+        fullWidth: false,
+        /** 既知の ref から到達できないコミット (MR の一時 ref) を隠すか */
+        hidePhantom: true,
+        /** 到達可能性フィルタで隠した件数 */
+        hiddenCount: 0,
+
+        /** email -> アバター URL。取得に失敗した email は null を入れて再試行しない */
+        avatarCache: new Map(),
+        /** 取得待ち・取得中の email。二重にリクエストしないための目印 */
+        avatarQueued: new Set(),
+        avatarQueue: [],
+        avatarActive: 0,
     };
 
     const ui = {
@@ -142,9 +170,12 @@
         branchList: null,
         filterInput: null,
         moreButton: null,
+        phantomToggle: null,
         countLabel: null,
         refLabel: null,
+        fullWidthButton: null,
         nativeButton: null,
+        returnButton: null,
         graphCol: null,
         graphHead: null,
         tbody: null,
@@ -175,6 +206,35 @@
         // 自前のサブツリーにしか当たらない選択子なので、非表示の強制以外に !important は使わない。
         style.textContent = `.glg-hidden {
     display: none !important;
+}
+
+/* GitLab のコンテンツ幅制限を外す。クラス名は世代によって違うので、既知のものと部分一致の両方を狙う */
+html.glg-full-width .container-limited,
+html.glg-full-width .limit-container-width,
+html.glg-full-width .gl-container-limited,
+html.glg-full-width [class*="container-limited"],
+html.glg-full-width [class*="limit-container-width"] {
+    max-width: none !important;
+}
+
+.glg-return {
+    display: block;
+    margin: 8px 0;
+    padding: 4px 10px;
+    border: 1px solid #dcdcde;
+    border-radius: 4px;
+    background: #ffffff;
+    color: #1f1e24;
+    cursor: pointer;
+    font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans JP", sans-serif;
+    font-size: 13px;
+}
+
+body.gl-dark .glg-return,
+html.gl-dark .glg-return {
+    border-color: #3b3a44;
+    background: #28272d;
+    color: #ececef;
 }
 
 .glg-root {
@@ -252,6 +312,29 @@ html.gl-dark .glg-root {
     flex: 0 1 260px;
 }
 
+/* チェックボックスは入力欄用の指定 (flex 伸縮・高さ) を打ち消す */
+.glg-toolbar input[type="checkbox"] {
+    flex: 0 0 auto;
+    box-sizing: content-box;
+    width: 13px;
+    min-width: 0;
+    max-width: none;
+    height: 13px;
+    margin: 0;
+    padding: 0;
+}
+
+.glg-toggle {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 4px;
+    color: var(--glg-fg-muted);
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
 .glg-toolbar button {
     cursor: pointer;
 }
@@ -259,6 +342,12 @@ html.gl-dark .glg-root {
 .glg-toolbar button:disabled {
     opacity: 0.5;
     cursor: default;
+}
+
+.glg-toolbar button[aria-pressed="true"] {
+    border-color: var(--glg-accent);
+    background: var(--glg-bg-selected);
+    font-weight: 700;
 }
 
 .glg-spacer {
@@ -451,6 +540,44 @@ html.gl-dark .glg-root {
     text-overflow: ellipsis;
 }
 
+.glg-author-inner {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: ${ROW_HEIGHT}px;
+    overflow: hidden;
+}
+
+/* 取得前・失敗時は頭文字入りの色付き円。行の高さを変えないサイズに固定する */
+.glg-avatar {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: ${AVATAR_PX}px;
+    height: ${AVATAR_PX}px;
+    overflow: hidden;
+    border-radius: 50%;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    user-select: none;
+}
+
+.glg-avatar-img {
+    display: block;
+    width: ${AVATAR_PX}px;
+    height: ${AVATAR_PX}px;
+    border-radius: 50%;
+    object-fit: cover;
+}
+
+.glg-author-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .glg-date,
 .glg-sha {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -531,13 +658,23 @@ html.gl-dark .glg-root {
 }
 
 .glg-file {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12px;
     line-height: 1.7;
     word-break: break-all;
+}
+
+.glg-file-link {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    color: inherit;
+    text-decoration: none;
+}
+
+.glg-file-link:hover .glg-path {
+    color: var(--glg-accent);
+    text-decoration: underline;
 }
 
 .glg-badge {
@@ -623,6 +760,24 @@ html.gl-dark .glg-root {
     // ユーティリティ
     // ---------------------------------------------------------------------
 
+    // localStorage は設定によって例外を投げる (プライベートモード・サードパーティ制限)。
+    // 保存できなくても機能そのものは動くべきなので、失敗は黙って諦める
+    const readStorage = (key) => {
+        try {
+            return localStorage.getItem(key);
+        } catch {
+            return null;
+        }
+    };
+
+    const writeStorage = (key, value) => {
+        try {
+            localStorage.setItem(key, value);
+        } catch {
+            /* 保存できないだけなので何もしない */
+        }
+    };
+
     const pad2 = (value) => String(value).padStart(2, "0");
 
     /** YYYY-MM-DD HH:mm (ローカルタイム) */
@@ -701,6 +856,11 @@ html.gl-dark .glg-root {
 
     const fetchProject = () => fetchJson(projectApi("", null));
 
+    // ブランチ 1 本だけを名前で引く。一覧はアルファベット順の 100 件しか返らないので、
+    // default branch がそこに載らないリポジトリ (gitlab-development-kit など) でも確実に取れる。
+    // ブランチ名にスラッシュが入るので encodeURIComponent が必須
+    const fetchBranch = (name) => fetchJson(projectApi(`/repository/branches/${encodeURIComponent(name)}`, null));
+
     // search を付けるとサーバ側で絞り込める。付けないとアルファベット順の先頭 100 件しか見えない
     const fetchBranches = (search, signal) => {
         const params = { per_page: String(PER_PAGE) };
@@ -732,11 +892,32 @@ html.gl-dark .glg-root {
     const fetchCommitDiff = (sha) =>
         fetchJson(projectApi(`/repository/commits/${encodeURIComponent(sha)}/diff`, { per_page: String(DIFF_LIMIT) }));
 
+    // /api/v4/avatar は GitLab 自身がアバター解決に使っているエンドポイントで、
+    // プロジェクト配下ではなく認証も不要。返る URL は Gravatar 等の外部にもなるが、
+    // GitLab のページ自身が同じ URL を <img> で読んでいるのでページの CSP と整合する
+    const fetchAvatarUrl = async (email) => {
+        const url = `${location.origin}/api/v4/avatar?${new URLSearchParams({
+            email,
+            size: String(AVATAR_REQUEST_SIZE),
+        }).toString()}`;
+        const payload = await fetchJson(url);
+        return typeof payload?.avatar_url === "string" ? payload.avatar_url : "";
+    };
+
+    /** ファイルパスの SHA-1 (hex)。secure context でなければ空文字を返す */
+    const sha1Hex = async (text) => {
+        const subtle = window.crypto?.subtle;
+        if (!subtle) return "";
+        const digest = await subtle.digest("SHA-1", new TextEncoder().encode(text));
+        return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    };
+
     const normalizeCommit = (raw) => ({
         sha: raw.id ?? "",
         shortSha: raw.short_id ?? String(raw.id ?? "").slice(0, 8),
         title: raw.title ?? "",
         authorName: raw.author_name ?? "",
+        authorEmail: raw.author_email ?? "",
         committedDate: raw.committed_date ?? raw.created_at ?? "",
         time: Date.parse(raw.committed_date ?? raw.created_at ?? "") || 0,
         parents: Array.isArray(raw.parent_ids) ? raw.parent_ids.filter((id) => typeof id === "string") : [],
@@ -826,15 +1007,83 @@ html.gl-dark .glg-root {
     };
 
     // ---------------------------------------------------------------------
+    // 幹 (mainline) の抽出
+    // ---------------------------------------------------------------------
+
+    // 表示中の ref の先端から第 1 親をたどった連なりを「幹」として扱い、専用レーンを与える。
+    // これが無いと、bot が作った大量のブランチ先端に左のレーンを取られて幹のレーンが毎行入れ替わり、
+    // マージコミットが繋がっていないように見える (2026-08-01 に gitlab-development-kit で観測)。
+    const collectMainline = (ordered, tipSha) => {
+        const spine = new Set();
+        if (!tipSha) return spine;
+
+        const byId = new Map();
+        for (const commit of ordered) byId.set(commit.sha, commit);
+
+        let current = byId.get(tipSha);
+        while (current && !spine.has(current.sha)) {
+            spine.add(current.sha);
+            const parents = uniqueParents(current.parents);
+            current = parents.length > 0 ? byId.get(parents[0]) : null;
+        }
+        return spine;
+    };
+
+    // ---------------------------------------------------------------------
+    // 到達可能性フィルタ (MR の一時 ref を落とす)
+    // ---------------------------------------------------------------------
+
+    // all=true は「リポジトリの全コミット」を返すので、GitLab が MR ごとに内部生成する
+    // 一時 ref (refs/merge-requests/N/merge = merged results パイプライン用のテストマージ) も混ざる。
+    // これらはどのブランチにも属さない先端なので、ブランチ/タグの先端から辿り直して除外する。
+    // 2026-08-01 に gitlab-org/gitlab-development-kit で、階段状に並んでいた
+    // 「Merge branch 'X' into 'main'」6 件がいずれも ref_name=main の履歴に無いことを確認した。
+    const collectReachable = (commits, rootShas) => {
+        const byId = new Map();
+        for (const commit of commits) byId.set(commit.sha, commit);
+
+        const seen = new Set();
+        const stack = [];
+        for (const sha of rootShas) {
+            if (!byId.has(sha) || seen.has(sha)) continue;
+            seen.add(sha);
+            stack.push(sha);
+        }
+
+        while (stack.length > 0) {
+            const commit = byId.get(stack.pop());
+            for (const parent of uniqueParents(commit.parents)) {
+                if (!byId.has(parent) || seen.has(parent)) continue;
+                seen.add(parent);
+                stack.push(parent);
+            }
+        }
+
+        return seen;
+    };
+
+    // ---------------------------------------------------------------------
     // レーン割り当て
     // ---------------------------------------------------------------------
 
+    /** 幹に予約するレーン */
+    const SPINE_LANE = 0;
+
     // lanes[i] は「レーン i が次に期待する sha」。null は空きレーン。
     // ウィンドウ外の親を期待したままのレーンは最後まで埋まらないので、下端まで線が伸びる。
-    const assignLanes = (ordered) => {
+    const assignLanes = (ordered, mainlineShas) => {
+        const spine = mainlineShas instanceof Set && mainlineShas.size > 0 ? mainlineShas : null;
         const lanes = [];
+        // そのレーンに連続して置いたコミット数。長く続いている線を優先して残すために使う
+        const laneRuns = [];
         const rows = [];
         let laneCount = 0;
+
+        // 幹があるときはレーン 0 を予約し、他のブランチに使わせない
+        if (spine) {
+            lanes.push(null);
+            laneRuns.push(0);
+        }
 
         const noteLane = (index) => {
             if (index + 1 > laneCount) laneCount = index + 1;
@@ -842,10 +1091,22 @@ html.gl-dark .glg-root {
 
         const takeFreeLane = (blocked) => {
             for (let i = 0; i < lanes.length; i += 1) {
+                if (spine && i === SPINE_LANE) continue;
                 if (lanes[i] === null && !blocked.has(i)) return i;
             }
             lanes.push(null);
+            laneRuns.push(0);
             return lanes.length - 1;
+        };
+
+        // 複数のレーンが同じコミットを期待しているとき、どれを残すか。
+        // 最も長く続いている線を残し、短い線をそこへ合流させる (同じ長さなら左)
+        const pickLongestRun = (candidates) => {
+            let best = candidates[0];
+            for (const index of candidates) {
+                if (laneRuns[index] > laneRuns[best]) best = index;
+            }
+            return best;
         };
 
         for (const commit of ordered) {
@@ -857,8 +1118,16 @@ html.gl-dark .glg-root {
             // この行で解放したレーンは同じ行で再利用しない (合流と分岐が同じ位置で重なって読めなくなる)
             const blocked = new Set();
 
-            // 期待しているレーンが無ければブランチ先端。左端の空きレーンを確保する
-            const lane = expecting.length === 0 ? takeFreeLane(blocked) : expecting[0];
+            let lane;
+            if (spine && spine.has(commit.sha) && (lanes[SPINE_LANE] === null || lanes[SPINE_LANE] === commit.sha)) {
+                // 幹は常に予約レーン。他のレーンからの期待はすべてここへ合流させる
+                lane = SPINE_LANE;
+            } else if (expecting.length === 0) {
+                // 期待しているレーンが無ければブランチ先端。左端の空きレーンを確保する
+                lane = takeFreeLane(blocked);
+            } else {
+                lane = pickLongestRun(expecting);
+            }
             noteLane(lane);
 
             // 通過するだけのレーン。合流するレーンを解放する前に数える
@@ -871,21 +1140,30 @@ html.gl-dark .glg-root {
                 noteLane(i);
             }
 
-            // 期待していた他のレーンはドットへカーブして合流し、解放される
+            // 自分のレーン以外で期待していたレーンは、ドットへカーブして合流し解放される
             const merges = [];
-            for (let k = 1; k < expecting.length; k += 1) {
-                const index = expecting[k];
+            for (const index of expecting) {
+                if (index === lane) continue;
                 merges.push(index);
                 lanes[index] = null;
+                laneRuns[index] = 0;
                 blocked.add(index);
                 noteLane(index);
             }
+
+            // 期待されていないレーンに置いた場合 (ブランチ先端・幹の初出) はそこから線が始まる
+            const hasTop = expecting.includes(lane);
+            if (!hasTop) laneRuns[lane] = 0;
+            laneRuns[lane] += 1;
 
             const parents = uniqueParents(commit.parents);
 
             // 自分のレーンは第 1 親を期待するようになる。親が無ければ閉じる
             lanes[lane] = parents.length > 0 ? parents[0] : null;
-            if (lanes[lane] === null) blocked.add(lane);
+            if (lanes[lane] === null) {
+                laneRuns[lane] = 0;
+                blocked.add(lane);
+            }
 
             // 第 2 親以降は、既にその sha を期待しているレーンへ繋ぐか、空きレーンを新規確保する
             const branches = [];
@@ -895,13 +1173,19 @@ html.gl-dark .glg-root {
                 if (target === -1) {
                     target = takeFreeLane(blocked);
                     lanes[target] = parent;
+                    laneRuns[target] = 0;
                 }
                 branches.push(target);
                 noteLane(target);
             }
 
-            // 右端の空きレーンは畳んで、グラフ列が無駄に広がらないようにする
-            while (lanes.length > 0 && lanes[lanes.length - 1] === null) lanes.pop();
+            // 右端の空きレーンは畳んで、グラフ列が無駄に広がらないようにする。
+            // 幹の予約レーンは空でも畳まない (畳むと他のブランチに取られる)
+            const minLanes = spine ? 1 : 0;
+            while (lanes.length > minLanes && lanes[lanes.length - 1] === null) {
+                lanes.pop();
+                laneRuns.pop();
+            }
 
             const activeAfter = [];
             for (let i = 0; i < lanes.length; i += 1) {
@@ -912,7 +1196,7 @@ html.gl-dark .glg-root {
                 sha: commit.sha,
                 commit,
                 lane,
-                hasTop: expecting.length > 0,
+                hasTop,
                 hasBottom: parents.length > 0,
                 isMerge: parents.length > 1,
                 passLanes,
@@ -1123,11 +1407,29 @@ html.gl-dark .glg-root {
             for (const file of payload.diff) {
                 const item = el("li", "glg-file");
                 const badge = diffBadge(file);
-                item.appendChild(el("span", badge.className, badge.label));
-                const path = file.renamed_file
+                const label = file.renamed_file
                     ? `${file.old_path} → ${file.new_path}`
                     : (file.new_path ?? file.old_path ?? "");
-                item.appendChild(el("span", "glg-path", path));
+                // 削除されたファイルでも new_path に同じパスが入るので、常に new_path を使う
+                const target = file.new_path ?? file.old_path ?? "";
+
+                const link = el("a", "glg-file-link");
+                link.href = `${commitWebUrl(row.commit)}?file_path=${encodeURIComponent(target)}`;
+                link.target = "_blank";
+                link.rel = "noopener";
+                link.title = `${label} の diff を開く`;
+                link.appendChild(el("span", badge.className, badge.label));
+                link.appendChild(el("span", "glg-path", label));
+
+                // GitLab の diff のアンカーはファイルパスの SHA-1 (2026-08-01 に gitlab.com で確認)。
+                // crypto.subtle は secure context 専用なので、使えない環境では file_path だけのリンクにする
+                if (target) {
+                    void sha1Hex(target).then((hex) => {
+                        if (hex) link.href = `${link.href}#${hex}`;
+                    });
+                }
+
+                item.appendChild(link);
                 list.appendChild(item);
             }
             if (payload.diff.length === 0) {
@@ -1218,6 +1520,108 @@ html.gl-dark .glg-root {
     };
 
     // ---------------------------------------------------------------------
+    // 作者アバター
+    // ---------------------------------------------------------------------
+
+    /** email から安定した色を選ぶ (取得前・失敗時のプレースホルダ用) */
+    const avatarColor = (email) => {
+        let hash = 5381;
+        for (let i = 0; i < email.length; i += 1) hash = ((hash << 5) + hash + email.charCodeAt(i)) | 0;
+        return LANE_COLORS[Math.abs(hash) % LANE_COLORS.length];
+    };
+
+    const avatarInitial = (name) => {
+        // サロゲートペアを壊さないよう配列展開で 1 文字取る
+        const first = [...(name ?? "").trim()][0];
+        return first ? first.toUpperCase() : "?";
+    };
+
+    const fillAvatarPlaceholder = (node, commit) => {
+        node.textContent = avatarInitial(commit.authorName);
+        node.style.background = avatarColor(commit.authorEmail || commit.authorName);
+        node.style.color = "#ffffff";
+    };
+
+    const fillAvatarImage = (node, commit, url) => {
+        const img = document.createElement("img");
+        img.className = "glg-avatar-img";
+        img.src = url;
+        img.alt = `${commit.authorName} のアバター`;
+        // IDL プロパティを実装していない環境でも属性として残るよう setAttribute で入れる
+        img.setAttribute("loading", "lazy");
+        img.width = AVATAR_PX;
+        img.height = AVATAR_PX;
+        // 読めなかったらプレースホルダに戻し、以後この email は取りに行かない
+        img.addEventListener("error", () => {
+            state.avatarCache.set(commit.authorEmail, null);
+            fillAvatarPlaceholder(node, commit);
+        });
+        node.textContent = "";
+        node.style.background = "transparent";
+        node.appendChild(img);
+    };
+
+    /** 解決済みの email について、描画済みのプレースホルダを差し替える */
+    const applyAvatar = (email) => {
+        if (!ui.tbody) return;
+        const url = state.avatarCache.get(email);
+        if (!url) return;
+        for (const node of ui.tbody.querySelectorAll(`.glg-avatar[data-glg-email="${CSS.escape(email)}"]`)) {
+            const sha = node.getAttribute("data-glg-avatar-sha") ?? "";
+            const row = state.rowsBySha.get(sha);
+            if (!row) continue;
+            fillAvatarImage(node, row.commit, url);
+        }
+    };
+
+    const pumpAvatarQueue = () => {
+        while (state.avatarActive < AVATAR_CONCURRENCY && state.avatarQueue.length > 0) {
+            const email = state.avatarQueue.shift();
+            if (state.avatarCache.has(email)) continue;
+            state.avatarActive += 1;
+            void fetchAvatarUrl(email)
+                .then((url) => {
+                    state.avatarCache.set(email, url || null);
+                    applyAvatar(email);
+                })
+                .catch(() => {
+                    // アバターが出ないだけなので、エラー行は出さずプレースホルダのままにする
+                    state.avatarCache.set(email, null);
+                })
+                .finally(() => {
+                    state.avatarActive -= 1;
+                    pumpAvatarQueue();
+                });
+        }
+    };
+
+    /** 表示された行のユニークな email だけを、少しずつ取りに行く */
+    const requestAvatar = (email) => {
+        if (!email) return;
+        if (state.avatarCache.has(email) || state.avatarQueued.has(email)) return;
+        state.avatarQueued.add(email);
+        state.avatarQueue.push(email);
+        pumpAvatarQueue();
+    };
+
+    const buildAvatar = (row) => {
+        const commit = row.commit;
+        const node = el("span", "glg-avatar");
+        node.setAttribute("data-glg-email", commit.authorEmail);
+        node.setAttribute("data-glg-avatar-sha", row.sha);
+        node.title = commit.authorEmail ? `${commit.authorName} <${commit.authorEmail}>` : commit.authorName;
+
+        const cached = state.avatarCache.get(commit.authorEmail);
+        if (cached) {
+            fillAvatarImage(node, commit, cached);
+            return node;
+        }
+        fillAvatarPlaceholder(node, commit);
+        if (cached === undefined) requestAvatar(commit.authorEmail);
+        return node;
+    };
+
+    // ---------------------------------------------------------------------
     // テーブル描画
     // ---------------------------------------------------------------------
 
@@ -1267,8 +1671,15 @@ html.gl-dark .glg-root {
         if (state.filter) graph.classList.add("glg-graph-dimmed");
         graphCell.appendChild(graph);
 
-        const author = el("td", "glg-author", row.commit.authorName);
-        author.title = row.commit.authorName;
+        const author = el("td", "glg-author");
+        const authorInner = el("div", "glg-author-inner");
+        authorInner.appendChild(buildAvatar(row));
+        const authorName = el("span", "glg-author-name", row.commit.authorName);
+        authorName.title = row.commit.authorEmail
+            ? `${row.commit.authorName} <${row.commit.authorEmail}>`
+            : row.commit.authorName;
+        authorInner.appendChild(authorName);
+        author.appendChild(authorInner);
 
         const date = el("td", "glg-date", formatDateTime(row.commit.committedDate));
         const sha = el("td", "glg-sha", row.commit.shortSha);
@@ -1296,7 +1707,12 @@ html.gl-dark .glg-root {
         // 上下に余白を残して画面内に収まっている間はスクロールしない (vim の scrolloff に近い挙動)
         const rect = rowEl.getBoundingClientRect();
         const comfortable = rect.top >= SCROLL_MARGIN_PX && rect.bottom <= window.innerHeight - SCROLL_MARGIN_PX;
-        if (!comfortable) rowEl.scrollIntoView({ block: "center" });
+        if (comfortable) return;
+
+        // scrollIntoView は横方向のスクロールコンテナ (.glg-table-wrap) も動かすため、
+        // テーブルが表示幅より広いとグラフ列が横にずれて見える。縦方向だけ自分でスクロールする
+        const top = window.scrollY + rect.top - (window.innerHeight - rect.height) / 2;
+        window.scrollTo({ top: Math.max(top, 0) });
     };
 
     const renderStatus = () => {
@@ -1311,9 +1727,11 @@ html.gl-dark .glg-root {
         // 取得に失敗した 0 件を「(全件)」と表示すると、成功して 0 件だったのと見分けが付かない
         const scope = state.mode === "ref" ? state.refName : "全ブランチ";
         const complete = !state.hasMore && state.commits.length > 0 && !hasError("commits");
+        // 表示は到達可能性フィルタとテキストフィルタの後、読み込み済みはフィルタ前の件数
+        const hidden = state.hiddenCount > 0 ? ` ・ MR の一時コミット ${state.hiddenCount} 件を非表示` : "";
         ui.countLabel.textContent = `${scope}: 表示 ${state.visibleRows.length} 件 / 読み込み済み ${state.commits.length} 件${
             complete ? " (全件)" : ""
-        }`;
+        }${hidden}`;
         ui.moreButton.disabled = state.loading || !state.hasMore;
         ui.moreButton.textContent = state.loading ? "読み込み中…" : "さらに読み込む";
     };
@@ -1389,9 +1807,42 @@ html.gl-dark .glg-root {
     // データロード
     // ---------------------------------------------------------------------
 
+    /** 到達可能性フィルタの起点。branches / tags / 幹の先端 */
+    const refTipShas = () => {
+        const shas = [];
+        for (const branch of state.branches) {
+            if (branch.commit?.id) shas.push(branch.commit.id);
+        }
+        for (const tag of state.tags) {
+            if (tag.commit?.id) shas.push(tag.commit.id);
+        }
+        if (state.mainlineTip) shas.push(state.mainlineTip);
+        return shas;
+    };
+
+    /**
+     * 表示対象のコミットを決める。
+     * ref_name モードはサーバ側がその ref の履歴しか返さないのでフィルタしない。
+     * 起点 (branches / tags / 幹) がまだ 1 つも届いていない間は、暫定的に全件表示する。
+     */
+    const visibleCommits = () => {
+        state.hiddenCount = 0;
+        if (!state.hidePhantom || state.mode === "ref") return state.commits;
+
+        const roots = refTipShas();
+        if (roots.length === 0) return state.commits;
+
+        const reachable = collectReachable(state.commits, roots);
+        if (reachable.size === 0) return state.commits;
+
+        const kept = state.commits.filter((commit) => reachable.has(commit.sha));
+        state.hiddenCount = state.commits.length - kept.length;
+        return kept;
+    };
+
     const rebuildGraph = () => {
-        const ordered = topoSortCommits(state.commits);
-        const result = assignLanes(ordered);
+        const ordered = topoSortCommits(visibleCommits());
+        const result = assignLanes(ordered, collectMainline(ordered, state.mainlineTip));
         state.graphRows = result.rows;
         state.laneCount = result.laneCount;
         state.rowsBySha = new Map(result.rows.map((row) => [row.sha, row]));
@@ -1518,14 +1969,47 @@ html.gl-dark .glg-root {
         state.rowsBySha = new Map();
         state.selectedSha = "";
         state.expandedSha = "";
+        state.mainlineTip = "";
         // 消すのはコミット取得のエラーだけ。プロジェクト情報や ref 一覧のエラーは残す
         clearErrors("commits");
+    };
+
+    /**
+     * 幹の先端 sha を取り直す。
+     * 一覧 (アルファベット順 100 件) には default branch が載らないリポジトリがあるため、
+     * ブランチ名を指定して 1 本だけ引く (2026-08-01 に gitlab-development-kit で確認)。
+     * 失敗したら幹なしのフォールバック (laneRuns の最長勝ち) に任せる。
+     */
+    const loadMainlineTip = async () => {
+        const wanted = state.mode === "ref" ? state.refName : state.defaultBranch || state.ref;
+        if (!wanted) return;
+
+        state.mainlineToken += 1;
+        const token = state.mainlineToken;
+        try {
+            const payload = await fetchBranch(wanted);
+            // 取得を待つ間にブランチが切り替わっていたら、この結果は捨てる
+            if (token !== state.mainlineToken) return;
+
+            const sha = payload?.commit?.id ?? "";
+            if (!sha || sha === state.mainlineTip) return;
+            state.mainlineTip = sha;
+            // コミットより遅れて届いた場合もレーンを組み直す
+            if (ui.tbody) {
+                rebuildGraph();
+                renderTable();
+            }
+        } catch {
+            /* 404 等。幹なしで描く */
+        }
     };
 
     const reload = async () => {
         resetCommits();
         state.statusText = "読み込み中…";
         renderTable();
+        // コミット取得と並行させる。どちらが先に着いてもレーンは組み直される
+        void loadMainlineTip();
         await loadCommits(INITIAL_BATCHES);
     };
 
@@ -1548,7 +2032,9 @@ html.gl-dark .glg-root {
 
         rebuildRefs();
         renderBranchOptions();
-        // ref 一覧はコミット取得と並行で解決するので、遅れて届いた場合もチップを描き直す
+        // ref 一覧はコミット取得と並行で解決する。遅れて届いた場合、チップだけでなくレーンも組み直す
+        // (幹の先端 sha は branches API から取るので、届く前は幹なしで割り当てられている)
+        rebuildGraph();
         renderTable();
     };
 
@@ -1645,11 +2131,32 @@ html.gl-dark .glg-root {
         ui.refLabel.textContent = state.ref ? `ref: ${state.ref}` : "";
     };
 
-    const setNativeMode = (native) => {
+    const setNativeMode = (native, persist) => {
         state.nativeMode = native;
         if (state.nativeRoot) state.nativeRoot.classList.toggle("glg-hidden", !native);
         ui.root.classList.toggle("glg-hidden", native);
         ui.nativeButton.textContent = native ? "Git Graph 表示に戻す" : "ネイティブ表示に戻す";
+        // ネイティブ表示中は自前のツールバーごと隠れるので、戻る導線を別に出す
+        if (ui.returnButton) ui.returnButton.classList.toggle("glg-hidden", !native);
+        if (persist !== false) writeStorage(STORAGE_VIEW_MODE, native ? "native" : "custom");
+    };
+
+    const setHidePhantom = (hide, persist) => {
+        state.hidePhantom = hide;
+        ui.phantomToggle.checked = hide;
+        if (persist !== false) writeStorage(STORAGE_HIDE_PHANTOM, hide ? "1" : "0");
+        rebuildGraph();
+        renderTable();
+    };
+
+    // GitLab のコンテンツ幅制限 (container-limited 系) を外して、グラフをビューポート幅まで広げる。
+    // 制限クラスが無いレイアウトでは当たる要素が無く、実質何も起きない
+    const setFullWidth = (full, persist) => {
+        state.fullWidth = full;
+        document.documentElement.classList.toggle("glg-full-width", full);
+        ui.fullWidthButton.setAttribute("aria-pressed", full ? "true" : "false");
+        ui.fullWidthButton.title = full ? "GitLab の既定幅に戻す" : "ページの幅制限を外して全幅で表示する";
+        if (persist !== false) writeStorage(STORAGE_FULL_WIDTH, full ? "1" : "0");
     };
 
     const buildUi = (nativeRoot) => {
@@ -1696,6 +2203,27 @@ html.gl-dark .glg-root {
         const countLabel = el("span", "glg-count");
         const refLabel = el("span", "glg-ref-label");
 
+        const phantomLabel = el("label", "glg-toggle");
+        const phantomToggle = document.createElement("input");
+        phantomToggle.type = "checkbox";
+        phantomToggle.className = "glg-phantom";
+        phantomToggle.checked = true;
+        phantomLabel.title =
+            "all=true には MR ごとの一時 ref (テストマージ) も含まれる。ブランチ/タグから到達できないコミットを隠す";
+        phantomToggle.addEventListener("change", () => {
+            setHidePhantom(phantomToggle.checked);
+            // チェックボックスにフォーカスが残ると j/k がテーブルに届かなくなる
+            phantomToggle.blur();
+        });
+        phantomLabel.append(phantomToggle, document.createTextNode("MR の一時コミットを隠す"));
+
+        const fullWidthButton = el("button", "glg-fullwidth", "⛶ 全幅");
+        fullWidthButton.type = "button";
+        fullWidthButton.setAttribute("aria-pressed", "false");
+        fullWidthButton.addEventListener("click", () => {
+            setFullWidth(!state.fullWidth);
+        });
+
         const nativeButton = el("button", "glg-native", "ネイティブ表示に戻す");
         nativeButton.type = "button";
         nativeButton.addEventListener("click", () => {
@@ -1707,9 +2235,11 @@ html.gl-dark .glg-root {
             branchList,
             filterInput,
             moreButton,
+            phantomLabel,
             countLabel,
             refLabel,
             el("span", "glg-spacer"),
+            fullWidthButton,
             nativeButton,
         );
 
@@ -1755,6 +2285,14 @@ html.gl-dark .glg-root {
         wrap.appendChild(table);
         root.append(toolbar, status, wrap);
 
+        // ネイティブ表示中だけ出す「カスタム表示に戻す」ボタン。ネイティブのグラフの直前に置く
+        const returnButton = el("button", "glg-return glg-hidden", "◀ カスタム表示 (gitlab-graph) に戻す");
+        returnButton.type = "button";
+        returnButton.addEventListener("click", () => {
+            setNativeMode(false);
+        });
+        nativeRoot.insertAdjacentElement("beforebegin", returnButton);
+
         // ネイティブのグラフは削除せず隠すだけにして、いつでも戻せるようにする
         nativeRoot.classList.add("glg-hidden");
         nativeRoot.insertAdjacentElement("afterend", root);
@@ -1765,9 +2303,12 @@ html.gl-dark .glg-root {
         ui.branchList = branchList;
         ui.filterInput = filterInput;
         ui.moreButton = moreButton;
+        ui.phantomToggle = phantomToggle;
         ui.countLabel = countLabel;
         ui.refLabel = refLabel;
+        ui.fullWidthButton = fullWidthButton;
         ui.nativeButton = nativeButton;
+        ui.returnButton = returnButton;
         ui.graphCol = graphCol;
         ui.graphHead = graphHead;
         ui.tbody = tbody;
@@ -1776,6 +2317,11 @@ html.gl-dark .glg-root {
         renderBranchOptions();
         renderRefLabel();
         renderCount();
+
+        // 前回の表示モードと全幅設定を復元する (既定はカスタム表示・幅制限あり・一時コミットは隠す)
+        setHidePhantom(readStorage(STORAGE_HIDE_PHANTOM) !== "0", false);
+        setFullWidth(readStorage(STORAGE_FULL_WIDTH) === "1", false);
+        setNativeMode(readStorage(STORAGE_VIEW_MODE) === "native", false);
     };
 
     /** Vue の描画完了を待つ。タイムアウトしたら null を返し、ページには触れない */
