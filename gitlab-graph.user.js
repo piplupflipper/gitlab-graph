@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.1.1
+// @version      0.1.2
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -29,6 +29,8 @@
     /** 左端レーンの中心 x (px) */
     const LANE_ORIGIN_X = 9;
     const DOT_RADIUS = 3.5;
+    /** レーンの線の太さ (px)。line の stroke-width と、詳細行の rect の幅を一致させるために共有する */
+    const LANE_STROKE = 2;
     // bot が単発コミットのブランチを大量に作るリポジトリでは同時レーン数が数十〜数百になる
     // (2026-08-01 に gitlab.com の gitlab-org/gitlab-foss で確認)。
     // グラフ列を伸ばし放題にするとコミットタイトルが画面外へ押し出されるので、描画するレーン数を頭打ちにする
@@ -443,14 +445,18 @@ html.gl-dark .glg-root {
     background: var(--glg-bg-selected);
 }
 
-.glg-cell-graph,
-.glg-cell-graph-detail {
+/* padding は .glg-table td (詳細度 0,1,1) に負けないよう td を含めた選択子で指定する。
+   負けると通常行の SVG は左 padding 8px の後ろから流れ、絶対配置の詳細行 SVG は
+   padding を無視して padding box の左端に貼り付くため、詳細行だけ線が 8px 左にずれる */
+.glg-table td.glg-cell-graph,
+.glg-table td.glg-cell-graph-detail {
     padding: 0;
     position: relative;
     overflow: hidden;
 }
 
-.glg-cell-graph-detail svg {
+/* 通常行の SVG と原点を揃える。padding が 0 なので padding box = content box */
+.glg-table td.glg-cell-graph-detail svg {
     position: absolute;
     top: 0;
     left: 0;
@@ -1221,7 +1227,7 @@ html.gl-dark .glg-root {
         const midY = ROW_HEIGHT / 2;
 
         const line = (x1, y1, x2, y2, color) =>
-            svgEl("line", { x1, y1, x2, y2, stroke: color, "stroke-width": 2, "stroke-linecap": "round" });
+            svgEl("line", { x1, y1, x2, y2, stroke: color, "stroke-width": LANE_STROKE, "stroke-linecap": "round" });
 
         // 切り詰めると複数のレーンが同じ x に重なるので、縦線は 1 本だけ描く
         const drawnVerticals = new Set();
@@ -1248,7 +1254,7 @@ html.gl-dark .glg-root {
                     d: `M ${from} 0 C ${from} ${midY * 0.7}, ${dotX} ${midY * 0.3}, ${dotX} ${midY}`,
                     fill: "none",
                     stroke: laneColor(index),
-                    "stroke-width": 2,
+                    "stroke-width": LANE_STROKE,
                 }),
             );
         }
@@ -1261,7 +1267,7 @@ html.gl-dark .glg-root {
                     d: `M ${dotX} ${midY} C ${dotX} ${midY * 1.3}, ${to} ${midY * 1.7}, ${to} ${ROW_HEIGHT}`,
                     fill: "none",
                     stroke: laneColor(index),
-                    "stroke-width": 2,
+                    "stroke-width": LANE_STROKE,
                 }),
             );
         }
@@ -1297,11 +1303,12 @@ html.gl-dark .glg-root {
             if (drawn.has(x)) continue;
             drawn.add(x);
             // height="100%" の rect なら、SVG を縦に伸ばしても線幅が歪まない
+            // 中心を通常行の line と厳密に一致させる (line は x を中心に stroke が両側へ伸びる)
             svg.appendChild(
                 svgEl("rect", {
-                    x: x - 1,
+                    x: x - LANE_STROKE / 2,
                     y: 0,
-                    width: 2,
+                    width: LANE_STROKE,
                     height: "100%",
                     fill: laneColor(index),
                 }),
