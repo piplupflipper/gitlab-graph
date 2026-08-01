@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.1.3
+// @version      0.1.4
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -20,6 +20,11 @@
 
     /** ネイティブのグラフページの外枠。Vue が描き終わるまで存在しない */
     const NATIVE_ROOT_SELECTOR = ".project-network";
+    // GitLab 17.5 では ref 切替と英語の説明行が .project-network の外 (前) にある
+    // (app/views/projects/network/_head.html.haml)。カスタム表示中は行ごと隠す。
+    // 現行の gitlab.com にはこの要素が無いので、存在チェックで自然に no-op になる
+    const NATIVE_HEAD_SELECTOR = "#js-graph-ref-switcher";
+    const NATIVE_HEAD_BLOCK_SELECTOR = ".row-content-block";
     /** Vue の描画待ちを諦めるまでの時間 (ms) */
     const NATIVE_WAIT_MS = 10000;
 
@@ -150,6 +155,8 @@
 
         nativeMode: false,
         nativeRoot: null,
+        /** ネイティブの ref 切替・説明行を含むブロック (GitLab 17.5 系のみ存在) */
+        nativeHead: null,
         /** GitLab のコンテンツ幅制限を外しているか */
         fullWidth: false,
         /** 既知の ref から到達できないコミット (MR の一時 ref) を隠すか */
@@ -1219,56 +1226,181 @@ html.gl-dark .glg-root {
     // グラフ描画 (SVG)
     // ---------------------------------------------------------------------
 
+    const HALF_ROW = ROW_HEIGHT / 2;
+
+    // レーン間の遷移は、遷移元の行の中心から遷移先の行の中心まで ROW_HEIGHT ぶんの
+    // 大きな S 字 1 本で描く (VS Code の Git Graph と同じスパン)。
+    // 全体カーブは `M x0 0 C x0 H/2, x1 H/2, x1 H` (H = ROW_HEIGHT)。
+    // 行境界をまたぐので De Casteljau (t = 0.5) で 2 分割し、上下の行に半分ずつ描く。
+    // 分割点は必ず ((x0 + x1) / 2, H/2) で、両半分の接線ベクトルは ((x1 - x0) / 4, H/8) で一致する (C1 連続)。
+
+    /** 遷移の上半分。上側の行の「下半分セル」に描く (ローカル y は H/2 → H) */
+    const transitionUpperPath = (x0, x1) =>
+        `M ${x0} ${HALF_ROW} C ${x0} ${(ROW_HEIGHT * 3) / 4}, ${(3 * x0 + x1) / 4} ${(ROW_HEIGHT * 7) / 8}, ${
+            (x0 + x1) / 2
+        } ${ROW_HEIGHT}`;
+
+    /** 遷移の下半分。下側の行の「上半分セル」に描く (ローカル y は 0 → H/2) */
+    const transitionLowerPath = (x0, x1) =>
+        `M ${(x0 + x1) / 2} 0 C ${(x0 + 3 * x1) / 4} ${ROW_HEIGHT / 8}, ${x1} ${ROW_HEIGHT / 4}, ${x1} ${HALF_ROW}`;
+
+    /** 隣の行が無いときのフォールバック。半行に収めた小さい S 字 */
+    const halfRowPath = (x0, y0, x1, y1) => {
+        const controlY = (y0 + y1) / 2;
+        return `M ${x0} ${y0} C ${x0} ${controlY}, ${x1} ${controlY}, ${x1} ${y1}`;
+    };
+
+    /**
+     * 行ごとの描画セグメントを組み立てる。
+     * 遷移カーブが隣の行にまたがるため、遷移を集める 1 パス目と、行ごとに割り付ける 2 パス目に分ける。
+     * 結果は row.render に載せる (renderTable は再計算しない)。
+     */
+    const buildGraphSegments = (rows) => {
+        // key は `${上側の行の index}:${レーン index}`。
+        // 「行 R のドットから分岐」と「行 R+1 のドットへ合流」が同じレーンで起きた場合は
+        // 1 本のドット間 S 字に畳む (fromX と toX の両方が埋まる)
+        const transitions = new Map();
+        const entryFor = (topRow, laneIndex) => {
+            const key = `${topRow}:${laneIndex}`;
+            let entry = transitions.get(key);
+            if (!entry) {
+                entry = { topRow, laneIndex, fromX: null, toX: null };
+                transitions.set(key, entry);
+            }
+            return entry;
+        };
+
+        rows.forEach((row, index) => {
+            const dotX = laneDrawX(row.lane);
+            for (const laneIndex of row.merges) {
+                // 1 行前が無ければフォールバック (この行の中だけで描く)
+                if (index > 0) entryFor(index - 1, laneIndex).toX = dotX;
+            }
+            for (const laneIndex of row.branches) {
+                if (index < rows.length - 1) entryFor(index, laneIndex).fromX = dotX;
+            }
+        });
+
+        const startX = (entry) => entry.fromX ?? laneDrawX(entry.laneIndex);
+        const endX = (entry) => entry.toX ?? laneDrawX(entry.laneIndex);
+
+        // 遷移が占める半セルでは、そのレーンの縦線を描かない
+        const asTop = rows.map(() => []);
+        const asBottom = rows.map(() => []);
+        const suppressUpper = rows.map(() => new Set());
+        const suppressLower = rows.map(() => new Set());
+        for (const entry of transitions.values()) {
+            asTop[entry.topRow].push(entry);
+            asBottom[entry.topRow + 1].push(entry);
+            suppressLower[entry.topRow].add(entry.laneIndex);
+            suppressUpper[entry.topRow + 1].add(entry.laneIndex);
+        }
+
+        rows.forEach((row, index) => {
+            const verticals = [];
+            const curves = [];
+            const drawn = new Set();
+            const pushVertical = (x, y1, y2, color) => {
+                // 切り詰めで複数レーンが同じ x に重なったときは 1 本だけ描く
+                const key = `${x}:${y1}:${y2}`;
+                if (drawn.has(key)) return;
+                drawn.add(key);
+                verticals.push({ x, y1, y2, color });
+            };
+
+            const addLane = (laneIndex, x, upper, lower) => {
+                const color = laneColor(laneIndex);
+                const drawUpper = upper && !suppressUpper[index].has(laneIndex);
+                const drawLower = lower && !suppressLower[index].has(laneIndex);
+                // 上下とも縦線なら 1 本の線にまとめる
+                if (drawUpper && drawLower) pushVertical(x, 0, ROW_HEIGHT, color);
+                else if (drawUpper) pushVertical(x, 0, HALF_ROW, color);
+                else if (drawLower) pushVertical(x, HALF_ROW, ROW_HEIGHT, color);
+            };
+
+            for (const laneIndex of row.passLanes) addLane(laneIndex, laneDrawX(laneIndex), true, true);
+            addLane(row.lane, laneDrawX(row.lane), row.hasTop, row.hasBottom);
+
+            for (const entry of asTop[index]) {
+                curves.push({ d: transitionUpperPath(startX(entry), endX(entry)), color: laneColor(entry.laneIndex) });
+            }
+            for (const entry of asBottom[index]) {
+                curves.push({ d: transitionLowerPath(startX(entry), endX(entry)), color: laneColor(entry.laneIndex) });
+            }
+
+            // 隣の行が無いぶんはフォールバックの半行カーブで繋ぐ
+            const dotX = laneDrawX(row.lane);
+            if (index === 0) {
+                for (const laneIndex of row.merges) {
+                    curves.push({
+                        d: halfRowPath(laneDrawX(laneIndex), 0, dotX, HALF_ROW),
+                        color: laneColor(laneIndex),
+                    });
+                }
+            }
+            if (index === rows.length - 1) {
+                for (const laneIndex of row.branches) {
+                    curves.push({
+                        d: halfRowPath(dotX, HALF_ROW, laneDrawX(laneIndex), ROW_HEIGHT),
+                        color: laneColor(laneIndex),
+                    });
+                }
+            }
+
+            // 詳細パネル行に引き伸ばす縦線。遷移中のレーンは分割点 (中点) の x に置くと
+            // 上下の半カーブとぴったり繋がる
+            const midByLane = new Map();
+            for (const entry of asTop[index]) {
+                midByLane.set(entry.laneIndex, (startX(entry) + endX(entry)) / 2);
+            }
+            const detailLanes = [];
+            const detailDrawn = new Set();
+            for (const laneIndex of row.activeAfter) {
+                const x = midByLane.get(laneIndex) ?? laneDrawX(laneIndex);
+                if (detailDrawn.has(x)) continue;
+                detailDrawn.add(x);
+                detailLanes.push({ x, color: laneColor(laneIndex) });
+            }
+
+            row.render = { verticals, curves, detailLanes };
+        });
+    };
+
     // 行ごとに独立した小さい SVG を描く。詳細パネルで行の高さが変わっても、
     // 1 枚の巨大な SVG を描き直す必要がない。
     const buildRowGraph = (row) => {
         const width = graphWidth();
         const svg = svgEl("svg", { class: "glg-graph", width, height: ROW_HEIGHT });
-        const midY = ROW_HEIGHT / 2;
+        const midY = HALF_ROW;
+        const render = row.render ?? { verticals: [], curves: [], detailLanes: [] };
 
-        const line = (x1, y1, x2, y2, color) =>
-            svgEl("line", { x1, y1, x2, y2, stroke: color, "stroke-width": LANE_STROKE, "stroke-linecap": "round" });
-
-        // レーン間の遷移は三次ベジェで描く。制御点を両端と同じ x・区間の中点の y に置くと
-        // 両端の接線が垂直になり、上下の縦線と折れ目なく繋がる S 字になる (Git Graph と同じ描き方)
-        const curve = (x0, y0, x1, y1, color) => {
-            const controlY = (y0 + y1) / 2;
-            return svgEl("path", {
-                d: `M ${x0} ${y0} C ${x0} ${controlY}, ${x1} ${controlY}, ${x1} ${y1}`,
-                fill: "none",
-                stroke: color,
-                "stroke-width": LANE_STROKE,
-                "stroke-linecap": "round",
-            });
-        };
-
-        // 切り詰めると複数のレーンが同じ x に重なるので、縦線は 1 本だけ描く
-        const drawnVerticals = new Set();
-
-        for (const index of row.passLanes) {
-            const x = laneDrawX(index);
-            if (drawnVerticals.has(x)) continue;
-            drawnVerticals.add(x);
-            svg.appendChild(line(x, 0, x, ROW_HEIGHT, laneColor(index)));
+        for (const segment of render.verticals) {
+            svg.appendChild(
+                svgEl("line", {
+                    x1: segment.x,
+                    y1: segment.y1,
+                    x2: segment.x,
+                    y2: segment.y2,
+                    stroke: segment.color,
+                    "stroke-width": LANE_STROKE,
+                    "stroke-linecap": "round",
+                }),
+            );
         }
+
+        for (const segment of render.curves) {
+            svg.appendChild(
+                svgEl("path", {
+                    d: segment.d,
+                    fill: "none",
+                    stroke: segment.color,
+                    "stroke-width": LANE_STROKE,
+                    "stroke-linecap": "round",
+                }),
+            );
+        }
+
         const dotX = laneDrawX(row.lane);
-        if (row.hasTop) {
-            svg.appendChild(line(dotX, 0, dotX, midY, laneColor(row.lane)));
-        }
-        if (row.hasBottom) {
-            svg.appendChild(line(dotX, midY, dotX, ROW_HEIGHT, laneColor(row.lane)));
-        }
-
-        // 合流: 相手レーンの上端からドットへ。線の色は元のレーンのもの
-        for (const index of row.merges) {
-            svg.appendChild(curve(laneDrawX(index), 0, dotX, midY, laneColor(index)));
-        }
-
-        // 分岐 (マージコミットの第 2 親以降): ドットから相手レーンの下端へ
-        for (const index of row.branches) {
-            svg.appendChild(curve(dotX, midY, laneDrawX(index), ROW_HEIGHT, laneColor(index)));
-        }
-
         const dot = svgEl("circle", {
             class: row.isMerge ? "glg-dot glg-dot-merge" : "glg-dot",
             cx: dotX,
@@ -1294,20 +1426,16 @@ html.gl-dark .glg-root {
     const buildDetailGraph = (row) => {
         const width = graphWidth();
         const svg = svgEl("svg", { class: "glg-graph", width, height: "100%" });
-        const drawn = new Set();
-        for (const index of row.activeAfter) {
-            const x = laneDrawX(index);
-            if (drawn.has(x)) continue;
-            drawn.add(x);
-            // height="100%" の rect なら、SVG を縦に伸ばしても線幅が歪まない
-            // 中心を通常行の line と厳密に一致させる (line は x を中心に stroke が両側へ伸びる)
+        for (const lane of row.render?.detailLanes ?? []) {
+            // height="100%" の rect なら、SVG を縦に伸ばしても線幅が歪まない。
+            // 中心を通常行の line / カーブの分割点と厳密に一致させる
             svg.appendChild(
                 svgEl("rect", {
-                    x: x - LANE_STROKE / 2,
+                    x: lane.x - LANE_STROKE / 2,
                     y: 0,
                     width: LANE_STROKE,
                     height: "100%",
-                    fill: laneColor(index),
+                    fill: lane.color,
                 }),
             );
         }
@@ -1850,6 +1978,8 @@ html.gl-dark .glg-root {
         state.graphRows = result.rows;
         state.laneCount = result.laneCount;
         state.rowsBySha = new Map(result.rows.map((row) => [row.sha, row]));
+        // 描画セグメントは laneCount (= 切り詰め判定) が確定してから組む
+        buildGraphSegments(result.rows);
     };
 
     const rebuildRefs = () => {
@@ -2138,6 +2268,8 @@ html.gl-dark .glg-root {
     const setNativeMode = (native, persist) => {
         state.nativeMode = native;
         if (state.nativeRoot) state.nativeRoot.classList.toggle("glg-hidden", !native);
+        // ネイティブの ref 切替と説明行はカスタム表示中だけ隠す (無いホストでは null)
+        if (state.nativeHead) state.nativeHead.classList.toggle("glg-hidden", !native);
         ui.root.classList.toggle("glg-hidden", native);
         ui.nativeButton.textContent = native ? "Git Graph 表示に戻す" : "ネイティブ表示に戻す";
         // ネイティブ表示中は自前のツールバーごと隠れるので、戻る導線を別に出す
@@ -2318,6 +2450,9 @@ html.gl-dark .glg-root {
         ui.tbody = tbody;
 
         state.nativeRoot = nativeRoot;
+        const nativeSwitcher = document.querySelector(NATIVE_HEAD_SELECTOR);
+        state.nativeHead = nativeSwitcher ? nativeSwitcher.closest(NATIVE_HEAD_BLOCK_SELECTOR) : null;
+
         renderBranchOptions();
         renderRefLabel();
         renderCount();
