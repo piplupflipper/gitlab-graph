@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.2.2
+// @version      0.3.0
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -14,7 +14,7 @@
 (() => {
     "use strict";
 
-    const VERSION = "0.2.2";
+    const VERSION = "0.3.0";
 
     // ---------------------------------------------------------------------
     // 定数
@@ -57,6 +57,10 @@
     const INITIAL_BATCHES = 3;
     /** diff API の取得上限。これを超える変更ファイルは省略する */
     const DIFF_LIMIT = 100;
+    /** 選択がこの時間動かなければコミット詳細を先読みする (ms) */
+    const DWELL_PREFETCH_MS = 400;
+    /** コミット詳細キャッシュの最大件数 */
+    const DETAIL_CACHE_MAX = 50;
 
     /** フォーカス行が画面内に収まっているとみなすための上下マージン (px) */
     const SCROLL_MARGIN_PX = 80;
@@ -154,6 +158,8 @@
         expandedSha: "",
         /** sha -> { detail, diff, truncated } */
         detailCache: new Map(),
+        /** sha -> Promise<{ payload, complete }>。先読みと展開で同じ取得を共有する */
+        detailInFlight: new Map(),
         /** 詳細取得の世代。応答が返るまでに別の行を開いたら捨てる */
         detailToken: 0,
         /** 詳細パネルをまたぐ遷移用に描画を組み替えた、上側行の index。未適用なら -1 */
@@ -209,6 +215,9 @@
     let branchSearchTimer = 0;
     let branchSearchController = null;
     let commitController = null;
+    let dwellPrefetchTimer = 0;
+    /** タイマーを設定した選択 sha。同じ選択の再描画では 400ms を数え直さない */
+    let dwellPrefetchSha = "";
 
     class ApiError extends Error {
         constructor(status) {
@@ -1771,6 +1780,69 @@ html.gl-dark .glg-root {
         rowEl.insertAdjacentElement("afterend", buildDetailRow(row, payload));
     };
 
+    /** 詳細キャッシュへ追加し、現在展開中の項目を守りながら古い項目を捨てる */
+    const cacheDetail = (sha, payload) => {
+        state.detailCache.set(sha, payload);
+        while (state.detailCache.size > DETAIL_CACHE_MAX) {
+            const oldestEvictable = [...state.detailCache.keys()].find((key) => key !== state.expandedSha);
+            if (!oldestEvictable) break;
+            state.detailCache.delete(oldestEvictable);
+        }
+    };
+
+    /** sha 単位で詳細 + diff の取得を共有する。呼び出し元が結果の保存方法を決める */
+    const requestDetail = (sha) => {
+        const existing = state.detailInFlight.get(sha);
+        if (existing) return existing;
+
+        const payload = {};
+        const promise = Promise.allSettled([fetchCommitDetail(sha), fetchCommitDiff(sha)])
+            .then(([detailResult, diffResult]) => {
+                if (detailResult.status === "fulfilled") payload.detail = detailResult.value;
+                else payload.error = describeError(detailResult.reason);
+
+                if (diffResult.status === "fulfilled") {
+                    payload.diff = Array.isArray(diffResult.value) ? diffResult.value : [];
+                    payload.truncated = payload.diff.length >= DIFF_LIMIT;
+                } else {
+                    payload.diffError = describeError(diffResult.reason);
+                }
+
+                return {
+                    payload,
+                    complete: detailResult.status === "fulfilled" && diffResult.status === "fulfilled",
+                };
+            })
+            .finally(() => {
+                if (state.detailInFlight.get(sha) === promise) state.detailInFlight.delete(sha);
+            });
+        state.detailInFlight.set(sha, promise);
+        return promise;
+    };
+
+    /** 選択滞在からの先読み。失敗は表示も保存もせず、次回の展開に再試行させる */
+    const prefetchDetail = async (sha) => {
+        if (!sha || state.detailCache.has(sha)) return;
+        const { payload, complete } = await requestDetail(sha);
+        if (complete && !state.detailCache.has(sha)) cacheDetail(sha, payload);
+    };
+
+    const scheduleDwellPrefetch = () => {
+        const sha = state.selectedSha;
+        if (sha === dwellPrefetchSha) return;
+
+        clearTimeout(dwellPrefetchTimer);
+        dwellPrefetchTimer = 0;
+        dwellPrefetchSha = sha;
+        if (!sha) return;
+
+        dwellPrefetchTimer = setTimeout(() => {
+            dwellPrefetchTimer = 0;
+            if (state.selectedSha !== sha || state.detailCache.has(sha) || state.detailInFlight.has(sha)) return;
+            void prefetchDetail(sha);
+        }, DWELL_PREFETCH_MS);
+    };
+
     const loadDetail = async (sha) => {
         if (state.detailCache.has(sha)) {
             renderDetail();
@@ -1781,20 +1853,8 @@ html.gl-dark .glg-root {
         const token = state.detailToken;
         renderDetail();
 
-        const payload = {};
-        const [detailResult, diffResult] = await Promise.allSettled([fetchCommitDetail(sha), fetchCommitDiff(sha)]);
-
-        if (detailResult.status === "fulfilled") payload.detail = detailResult.value;
-        else payload.error = describeError(detailResult.reason);
-
-        if (diffResult.status === "fulfilled") {
-            payload.diff = Array.isArray(diffResult.value) ? diffResult.value : [];
-            payload.truncated = payload.diff.length >= DIFF_LIMIT;
-        } else {
-            payload.diffError = describeError(diffResult.reason);
-        }
-
-        state.detailCache.set(sha, payload);
+        const { payload } = await requestDetail(sha);
+        cacheDetail(sha, payload);
         // 応答を待つ間に別の行を開いていたら、この結果は描かない
         if (token !== state.detailToken || state.expandedSha !== sha) return;
         renderDetail();
@@ -1986,6 +2046,7 @@ html.gl-dark .glg-root {
         for (const node of ui.tbody.querySelectorAll(`.glg-row[${SELECTED_ATTR}]`)) {
             node.removeAttribute(SELECTED_ATTR);
         }
+        scheduleDwellPrefetch();
         if (!state.selectedSha) return;
         const rowEl = ui.tbody.querySelector(`.glg-row[${SHA_ATTR}="${CSS.escape(state.selectedSha)}"]`);
         if (rowEl) rowEl.setAttribute(SELECTED_ATTR, "");
@@ -2909,6 +2970,8 @@ html.gl-dark .glg-root {
             REF_PAGE_LIMIT,
             INITIAL_BATCHES,
             DIFF_LIMIT,
+            DWELL_PREFETCH_MS,
+            DETAIL_CACHE_MAX,
             BRANCH_SEARCH_DEBOUNCE_MS,
             LANE_COLORS,
             SPINE_LANE,
@@ -2933,6 +2996,7 @@ html.gl-dark .glg-root {
             buildDetailGraph,
             parseContext,
             sha1Hex,
+            prefetchDetail,
             state,
         });
     }

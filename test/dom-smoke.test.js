@@ -16,6 +16,8 @@ const {
 } = require("./helpers");
 
 const commitCalls = (env) => env.fetch.calls.filter((call) => call.url.pathname.endsWith("/repository/commits"));
+const detailCalls = (env) =>
+    env.fetch.calls.filter((call) => /\/repository\/commits\/[^/]+(?:\/diff)?$/.test(call.url.pathname));
 
 let basePromise;
 const base = () => {
@@ -1236,5 +1238,113 @@ test("dom-smoke 111: expanding every fixture row preserves edge multiplicity thr
         assert.deepStrictEqual(gutterXs(env), rowEdgeXs(env, rows[index + 1].sha, "top"), `gutter/lower ${rows[index].sha}`);
     }
     await waitFor(() => env.api.state.detailCache.has(rows.at(-2).sha), "final swept detail payload");
+    env.dom.window.close();
+});
+
+test("dom-smoke 112: dwelling on a selection prefetches detail and expansion uses the cache", async () => {
+    const env = await createDom();
+    const sha = env.api.state.selectedSha;
+    assert.strictEqual(detailCalls(env).length, 0);
+
+    await new Promise((resolve) => setTimeout(resolve, env.api.DWELL_PREFETCH_MS + 30));
+    await waitFor(() => env.api.state.detailCache.has(sha), "dwell-prefetched detail");
+    assert.strictEqual(detailCalls(env).length, 2);
+
+    dispatchKey(env.window, env.document.body, "Enter");
+    assert.ok(env.document.querySelector(".glg-detail-message"));
+    assert.strictEqual(detailCalls(env).length, 2);
+    env.dom.window.close();
+});
+
+test("dom-smoke 113: rapid j movement issues no detail fetch before the dwell threshold", async () => {
+    const commits = Array.from({ length: 12 }, (_, index) => {
+        const sha = `rapid${String(index).padStart(2, "0")}`;
+        const parent = index + 1 < 12 ? [`rapid${String(index + 1).padStart(2, "0")}`] : [];
+        return rawCommit(sha, parent, 12 - index);
+    });
+    const env = await createDom({
+        fixture: {
+            project: { default_branch: "main" },
+            branches: [{ name: "main", default: true, commit: { id: commits[0].id } }],
+            tags: [],
+            commits,
+        },
+    });
+
+    for (let index = 1; index < commits.length; index += 1) {
+        dispatchKey(env.window, env.document.body, "j");
+    }
+
+    assert.strictEqual(env.api.state.selectedSha, commits.at(-1).id);
+    assert.strictEqual(detailCalls(env).length, 0);
+    env.dom.window.close();
+});
+
+test("dom-smoke 114: expansion during a prefetch shares the in-flight detail requests", async () => {
+    const fixture = defaultFixture();
+    const pending = [];
+    fixture.fetch = (url) => {
+        if (!/\/repository\/commits\/[^/]+(?:\/diff)?$/.test(url.pathname)) return undefined;
+        return new Promise((resolve) => pending.push({ url, resolve }));
+    };
+    const env = await createDom({ fixture });
+    const sha = env.api.state.selectedSha;
+
+    await new Promise((resolve) => setTimeout(resolve, env.api.DWELL_PREFETCH_MS + 30));
+    await waitFor(() => pending.length === 2, "in-flight dwell prefetch");
+    assert.ok(env.api.state.detailInFlight.has(sha));
+    dispatchKey(env.window, env.document.body, "Enter");
+    assert.strictEqual(detailCalls(env).length, 2);
+
+    for (const request of pending) {
+        if (request.url.pathname.endsWith("/diff")) {
+            request.resolve(response([]));
+        } else {
+            const item = fixture.commits.find((commit) => commit.id === sha);
+            request.resolve(
+                response({
+                    ...item,
+                    message: `${item.title}\n\nPrefetched body`,
+                    stats: { additions: 1, deletions: 0 },
+                }),
+            );
+        }
+    }
+
+    await waitFor(() => env.document.querySelector(".glg-detail-message")?.textContent.includes("Prefetched body"), "shared detail payload");
+    assert.strictEqual(detailCalls(env).length, 2);
+    assert.ok(!env.api.state.detailInFlight.has(sha));
+    env.dom.window.close();
+});
+
+test("dom-smoke 115: revisiting a prefetched sha does not refetch it", async () => {
+    const env = await createDom();
+    const sha = env.api.state.selectedSha;
+    await new Promise((resolve) => setTimeout(resolve, env.api.DWELL_PREFETCH_MS + 30));
+    await waitFor(() => env.api.state.detailCache.has(sha), "initial dwell prefetch");
+    const before = detailCalls(env).length;
+
+    dispatchKey(env.window, env.document.body, "j");
+    dispatchKey(env.window, env.document.body, "k");
+    await new Promise((resolve) => setTimeout(resolve, env.api.DWELL_PREFETCH_MS + 30));
+
+    assert.strictEqual(env.api.state.selectedSha, sha);
+    assert.strictEqual(detailCalls(env).length, before);
+    env.dom.window.close();
+});
+
+test("dom-smoke 116: detail cache evicts the oldest eligible sha but protects the expanded sha", async () => {
+    const env = await createDom();
+    await env.api.prefetchDetail("cache000");
+    env.api.state.expandedSha = "cache000";
+
+    for (let index = 1; index <= env.api.DETAIL_CACHE_MAX; index += 1) {
+        await env.api.prefetchDetail(`cache${String(index).padStart(3, "0")}`);
+    }
+
+    assert.strictEqual(env.api.state.detailCache.size, env.api.DETAIL_CACHE_MAX);
+    assert.ok(env.api.state.detailCache.has("cache000"));
+    assert.ok(!env.api.state.detailCache.has("cache001"));
+    assert.ok(env.api.state.detailCache.has("cache002"));
     env.dom.window.close();
 });

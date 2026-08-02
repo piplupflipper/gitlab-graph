@@ -119,6 +119,9 @@ default branch と URL の ref は候補の先頭に常にピン留めするの�
 | Esc | 🚪 詳細パネルを閉じる (フィルタ入力中なら blur) |
 | l | ➕ さらに読み込む |
 
+選択した行に少し (400ms) とどまると、その詳細と変更ファイル一覧が先読みされる。⚡
+先読み済みのコミットは Enter での展開が即時になる。
+
 入力欄 (input / textarea / select / contenteditable) にフォーカスがあるときは、キー入力を一切横取りしない。🛡️
 自前のフィルタ入力・ブランチ入力も同じ扱いで、`j` / `k` などは普通に文字として入る。
 例外はこの 2 つの入力欄での Esc だけで、これは blur に使う。
@@ -171,6 +174,14 @@ gitlab-vim の `j` / `k` / `o` は `a[data-testid="issuable-title-link"]` が 1 
 ただし 2 つの userscript がどちらも document のキャプチャフェーズで待ち受けるので、同じキーを両方が処理するケースでの優先順位は登録順に依存する。⚠️
 
 ## 🧠 設計メモ
+
+### ⚡ 選択の滞在で詳細を先読みする
+
+選択が同じコミットに 400ms とどまったら、詳細と diff をバックグラウンドで取得してキャッシュする。
+j/k の連打中 (滞在 400ms 未満) はリクエストを一切発行しない。⏱️
+取得中に展開された場合は同じ取得を待ち合わせるため、fetch は sha ごとに最大 1 回。
+キャッシュは 50 件で頭打ちにし、挿入順の古いものから捨てる (展開中の sha は保護)。
+sha に紐づく詳細は不変なので、リロードやブランチ切替での破棄はしない。🗃️
 
 ### 🔌 same-origin の REST API v4 をセッション Cookie で叩く
 
@@ -468,4 +479,4 @@ CSS は `<style>` で注入し、class 名は `glg-` で始める。🏷️
 ---
 
 リポジトリ: [ngmtine/gitlab-graph](https://github.com/ngmtine/gitlab-graph)
-本 README の記述は 2026-08-02 時点の gitlab.com と gitlab-graph 0.2.2 に基づく。
+本 README の記述は 2026-08-02 時点の gitlab.com と gitlab-graph 0.3.0 に基づく。
