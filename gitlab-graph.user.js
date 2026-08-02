@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.2.0
+// @version      0.2.1
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -14,7 +14,7 @@
 (() => {
     "use strict";
 
-    const VERSION = "0.2.0";
+    const VERSION = "0.2.1";
 
     // ---------------------------------------------------------------------
     // 定数
@@ -156,6 +156,8 @@
         detailCache: new Map(),
         /** 詳細取得の世代。応答が返るまでに別の行を開いたら捨てる */
         detailToken: 0,
+        /** 詳細パネルをまたぐ遷移用に描画を組み替えた、上側行の index。未適用なら -1 */
+        detailBoundaryIndex: -1,
 
         /** [{ source, message }]。source ごとに消せるようにして、再取得で他のエラーを巻き添えにしない */
         errors: [],
@@ -1289,7 +1291,7 @@ html.gl-dark .glg-root {
      * 遷移カーブが隣の行にまたがるため、遷移を集める 1 パス目と、行ごとに割り付ける 2 パス目に分ける。
      * 結果は row.render に載せる (renderTable は再計算しない)。
      */
-    const buildGraphSegments = (rows) => {
+    const buildGraphSegments = (rows, detailBoundaryIndex = -1) => {
         // key は `${上側の行の index}:${レーン index}`。
         // 「行 R のドットから分岐」と「行 R+1 のドットへ合流」が同じレーンで起きた場合は
         // 1 本のドット間 S 字に畳む (fromX と toX の両方が埋まる)
@@ -1328,6 +1330,9 @@ html.gl-dark .glg-root {
             asBottom[entry.topRow + 1].push(entry);
             suppressLower[entry.topRow].add(entry.laneIndex);
             suppressUpper[entry.topRow + 1].add(entry.laneIndex);
+            if (entry.topRow === detailBoundaryIndex && entry.fromX === null) {
+                suppressUpper[entry.topRow].add(entry.laneIndex);
+            }
         }
 
         rows.forEach((row, index) => {
@@ -1356,10 +1361,18 @@ html.gl-dark .glg-root {
             addLane(row.lane, laneDrawX(row.lane), row.hasTop, row.hasBottom);
 
             for (const entry of asTop[index]) {
-                curves.push({ d: transitionUpperPath(startX(entry), endX(entry)), color: laneColor(entry.laneIndex) });
+                const d =
+                    index === detailBoundaryIndex
+                        ? halfRowPath(startX(entry), entry.fromX === null ? 0 : HALF_ROW, endX(entry), ROW_HEIGHT)
+                        : transitionUpperPath(startX(entry), endX(entry));
+                curves.push({ d, color: laneColor(entry.laneIndex) });
             }
             for (const entry of asBottom[index]) {
-                curves.push({ d: transitionLowerPath(startX(entry), endX(entry)), color: laneColor(entry.laneIndex) });
+                if (entry.topRow === detailBoundaryIndex) {
+                    pushVertical(endX(entry), 0, HALF_ROW, laneColor(entry.laneIndex));
+                } else {
+                    curves.push({ d: transitionLowerPath(startX(entry), endX(entry)), color: laneColor(entry.laneIndex) });
+                }
             }
 
             // 隣の行が無いぶんはフォールバックの半行カーブで繋ぐ
@@ -1382,23 +1395,26 @@ html.gl-dark .glg-root {
             }
 
             // 詳細パネル行に引き伸ばす縦線。この行の下端境界を通過する全レーンを描く。
-            // 遷移中のレーンだけは分割点 (中点) の x に置くと上下の半カーブとぴったり繋がる
-            const midByLane = new Map();
+            // 通常は遷移の分割点へ繋ぎ、パネルを挟む境界だけは上の行で遷移を完了した行き先へ繋ぐ。
+            const detailXByLane = new Map();
             for (const entry of asTop[index]) {
-                midByLane.set(entry.laneIndex, (startX(entry) + endX(entry)) / 2);
+                detailXByLane.set(
+                    entry.laneIndex,
+                    index === detailBoundaryIndex ? endX(entry) : (startX(entry) + endX(entry)) / 2,
+                );
             }
             const detailLanes = [];
             const detailDrawn = new Set();
             for (const laneIndex of row.activeAfter) {
-                const mid = midByLane.get(laneIndex);
-                if (mid !== undefined) {
+                const transitionX = detailXByLane.get(laneIndex);
+                if (transitionX !== undefined && index !== detailBoundaryIndex) {
                     // 分割点は隣のレーンの中心と一致することがある (レーン 0 -> 2 の中点 = レーン 1 の中心)。
                     // x で重複除外すると通過レーンの線が消えるので、遷移中のレーンは必ず描く
-                    detailLanes.push({ x: mid, color: laneColor(laneIndex) });
+                    detailLanes.push({ x: transitionX, color: laneColor(laneIndex) });
                     continue;
                 }
-                const x = laneDrawX(laneIndex);
-                // 切り詰めで同じ x に潰れたレーンだけをまとめる
+                const x = transitionX ?? laneDrawX(laneIndex);
+                // パネル境界で同じ行き先へ合流した線と、切り詰めで同じ x に潰れた線は 1 本にまとめる
                 if (detailDrawn.has(x)) continue;
                 detailDrawn.add(x);
                 detailLanes.push({ x, color: laneColor(laneIndex) });
@@ -1639,14 +1655,52 @@ html.gl-dark .glg-root {
         return tr;
     };
 
+    const redrawRowGraph = (row) => {
+        if (!row) return;
+        const rowEl = ui.tbody.querySelector(`.glg-row[${SHA_ATTR}="${CSS.escape(row.sha)}"]`);
+        const graphCell = rowEl?.querySelector(".glg-cell-graph");
+        if (!graphCell) return;
+        const graph = buildRowGraph(row);
+        if (state.filter) graph.classList.add("glg-graph-dimmed");
+        graphCell.replaceChildren(graph);
+    };
+
+    const redrawBoundaryRows = (index) => {
+        redrawRowGraph(state.graphRows[index]);
+        redrawRowGraph(state.graphRows[index + 1]);
+    };
+
+    const restoreDetailBoundary = () => {
+        if (state.detailBoundaryIndex < 0) return;
+        const oldIndex = state.detailBoundaryIndex;
+        buildGraphSegments(state.graphRows);
+        state.detailBoundaryIndex = -1;
+        redrawBoundaryRows(oldIndex);
+    };
+
     const renderDetail = () => {
         const existing = ui.tbody.querySelector(".glg-detail-row");
+        restoreDetailBoundary();
         if (existing) existing.remove();
         if (!state.expandedSha) return;
 
         const rowEl = ui.tbody.querySelector(`.glg-row[${SHA_ATTR}="${CSS.escape(state.expandedSha)}"]`);
         const row = state.rowsBySha.get(state.expandedSha);
         if (!rowEl || !row) return;
+
+        const index = state.graphRows.indexOf(row);
+        const nextRow = state.graphRows[index + 1];
+        const nextRowEl = rowEl.nextElementSibling;
+        const hasTransition = row.branches.length > 0 || (nextRow?.merges.length ?? 0) > 0;
+        const panelSplitsGraphBoundary =
+            index >= 0 &&
+            nextRow &&
+            nextRowEl?.matches(`.glg-row[${SHA_ATTR}="${CSS.escape(nextRow.sha)}"]`);
+        if (hasTransition && panelSplitsGraphBoundary) {
+            buildGraphSegments(state.graphRows, index);
+            state.detailBoundaryIndex = index;
+            redrawBoundaryRows(index);
+        }
 
         const payload = state.detailCache.get(state.expandedSha) ?? {};
         rowEl.insertAdjacentElement("afterend", buildDetailRow(row, payload));
@@ -1951,6 +2005,11 @@ html.gl-dark .glg-root {
     const renderTable = () => {
         const needle = state.filter.trim().toLowerCase();
         state.visibleRows = state.graphRows.filter((row) => matchesFilter(row, needle));
+
+        if (state.detailBoundaryIndex >= 0) {
+            buildGraphSegments(state.graphRows);
+            state.detailBoundaryIndex = -1;
+        }
 
         renderGraphColumn();
         ui.tbody.textContent = "";

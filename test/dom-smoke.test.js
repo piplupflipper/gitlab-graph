@@ -990,3 +990,99 @@ test("dom-smoke 104: VERSION constant exactly matches userscript metadata", () =
     assert.strictEqual(env.api.VERSION, metadata);
     env.dom.window.close();
 });
+
+let detailBoundaryPromise;
+const detailBoundary = () => {
+    if (!detailBoundaryPromise) {
+        const fixture = {
+            project: { default_branch: "main" },
+            branches: [
+                { name: "main", default: true, commit: { id: "merge" } },
+                { name: "other", default: false, commit: { id: "otherTip" } },
+            ],
+            tags: [],
+            commits: [
+                rawCommit("otherTip", ["otherParent"], 10),
+                rawCommit("merge", ["mainParent", "sideParent"], 9),
+                rawCommit("mainParent", ["root"], 8),
+                rawCommit("sideParent", ["root"], 7),
+                rawCommit("otherParent", ["root"], 1),
+                rawCommit("root", [], 0),
+            ],
+        };
+        detailBoundaryPromise = createDom({ fixture });
+    }
+    return detailBoundaryPromise;
+};
+
+const graphPaths = (env, sha) =>
+    [...env.document.querySelectorAll(`.glg-row[data-glg-sha="${sha}"] path`)].map((node) => node.getAttribute("d"));
+
+test("dom-smoke 105: detail gutter moves a colliding lane 0-to-2 midpoint onto distinct lane centers", async () => {
+    const env = await detailBoundary();
+    const row = env.api.state.rowsBySha.get("merge");
+    assert.deepStrictEqual(
+        [...row.render.detailLanes].map((lane) => lane.x),
+        [env.api.laneDrawX(0), env.api.laneDrawX(1), env.api.laneDrawX(1)],
+    );
+
+    env.document.querySelector('.glg-row[data-glg-sha="merge"]').click();
+    await waitFor(() => env.api.state.expandedSha === "merge" && env.document.querySelector(".glg-detail-row"), "collision detail row");
+
+    const centers = [...env.document.querySelectorAll(".glg-detail-row rect")].map(
+        (rect) => Number(rect.getAttribute("x")) + Number(rect.getAttribute("width")) / 2,
+    );
+    assert.deepStrictEqual(centers, [env.api.laneDrawX(0), env.api.laneDrawX(1), env.api.laneDrawX(2)]);
+    assert.strictEqual(new Set(centers).size, centers.length);
+});
+
+test("dom-smoke 106: detail boundary completes the curve above and enters below with an x1 vertical", async () => {
+    const env = await detailBoundary();
+    const x0 = env.api.laneDrawX(0);
+    const x1 = env.api.laneDrawX(2);
+    assert.ok(graphPaths(env, "merge").includes(env.api.halfRowPath(x0, env.api.HALF_ROW, x1, env.api.ROW_HEIGHT)));
+    assert.ok(!graphPaths(env, "mainParent").includes(env.api.transitionLowerPath(x0, x1)));
+
+    const entrance = [...env.document.querySelectorAll('.glg-row[data-glg-sha="mainParent"] line')].find(
+        (line) =>
+            Number(line.getAttribute("x1")) === x1 &&
+            Number(line.getAttribute("x2")) === x1 &&
+            Number(line.getAttribute("y1")) === 0 &&
+            Number(line.getAttribute("y2")) === env.api.HALF_ROW,
+    );
+    assert.ok(entrance);
+});
+
+test("dom-smoke 107: closing detail restores the standard split transition", async () => {
+    const env = await detailBoundary();
+    const x0 = env.api.laneDrawX(0);
+    const x1 = env.api.laneDrawX(2);
+    env.document.querySelector('.glg-row[data-glg-sha="merge"]').click();
+
+    assert.strictEqual(env.document.querySelector(".glg-detail-row"), null);
+    assert.strictEqual(env.api.state.detailBoundaryIndex, -1);
+    assert.ok(graphPaths(env, "merge").includes(env.api.transitionUpperPath(x0, x1)));
+    assert.ok(graphPaths(env, "mainParent").includes(env.api.transitionLowerPath(x0, x1)));
+});
+
+test("dom-smoke 108: moving detail to a non-transition boundary restores the old pair and leaves the new pair unchanged", async () => {
+    const env = await detailBoundary();
+    const sideBefore = env.document.querySelector('.glg-row[data-glg-sha="sideParent"] .glg-cell-graph').innerHTML;
+    const otherBefore = env.document.querySelector('.glg-row[data-glg-sha="otherParent"] .glg-cell-graph').innerHTML;
+    const x0 = env.api.laneDrawX(0);
+    const x1 = env.api.laneDrawX(2);
+
+    env.document.querySelector('.glg-row[data-glg-sha="merge"]').click();
+    env.document.querySelector('.glg-row[data-glg-sha="sideParent"]').click();
+    await waitFor(
+        () => env.api.state.expandedSha === "sideParent" && env.api.state.detailCache.has("sideParent"),
+        "moved detail payload",
+    );
+
+    assert.strictEqual(env.api.state.detailBoundaryIndex, -1);
+    assert.ok(graphPaths(env, "merge").includes(env.api.transitionUpperPath(x0, x1)));
+    assert.ok(graphPaths(env, "mainParent").includes(env.api.transitionLowerPath(x0, x1)));
+    assert.strictEqual(env.document.querySelector('.glg-row[data-glg-sha="sideParent"] .glg-cell-graph').innerHTML, sideBefore);
+    assert.strictEqual(env.document.querySelector('.glg-row[data-glg-sha="otherParent"] .glg-cell-graph').innerHTML, otherBefore);
+    env.dom.window.close();
+});
