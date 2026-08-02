@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitLab Git Graph
 // @namespace    https://github.com/ngmtine
-// @version      0.2.1
+// @version      0.2.2
 // @description  GitLab のリポジトリグラフを Git Graph 拡張風の見やすい表示に差し替える
 // @match        https://gitlab.com/*
 // @downloadURL  https://raw.githubusercontent.com/ngmtine/gitlab-graph/master/gitlab-graph.user.js
@@ -14,7 +14,7 @@
 (() => {
     "use strict";
 
-    const VERSION = "0.2.1";
+    const VERSION = "0.2.2";
 
     // ---------------------------------------------------------------------
     // 定数
@@ -1294,13 +1294,21 @@ html.gl-dark .glg-root {
     const buildGraphSegments = (rows, detailBoundaryIndex = -1) => {
         // key は `${上側の行の index}:${レーン index}`。
         // 「行 R のドットから分岐」と「行 R+1 のドットへ合流」が同じレーンで起きた場合は
-        // 1 本のドット間 S 字に畳む (fromX と toX の両方が埋まる)
+        // 1 本のドット間 S 字に畳む。座標だけでなく、その座標がドットか通過線かも持つ。
         const transitions = new Map();
         const entryFor = (topRow, laneIndex) => {
             const key = `${topRow}:${laneIndex}`;
             let entry = transitions.get(key);
             if (!entry) {
-                entry = { topRow, laneIndex, fromX: null, toX: null };
+                entry = {
+                    topRow,
+                    laneIndex,
+                    fromX: null,
+                    toX: null,
+                    fromOrigin: null,
+                    toOrigin: null,
+                    type: null,
+                };
                 transitions.set(key, entry);
             }
             return entry;
@@ -1310,15 +1318,43 @@ html.gl-dark .glg-root {
             const dotX = laneDrawX(row.lane);
             for (const laneIndex of row.merges) {
                 // 1 行前が無ければフォールバック (この行の中だけで描く)
-                if (index > 0) entryFor(index - 1, laneIndex).toX = dotX;
+                if (index > 0) {
+                    const entry = entryFor(index - 1, laneIndex);
+                    entry.toX = dotX;
+                    entry.toOrigin = "dot";
+                }
             }
             for (const laneIndex of row.branches) {
-                if (index < rows.length - 1) entryFor(index, laneIndex).fromX = dotX;
+                if (index < rows.length - 1) {
+                    const entry = entryFor(index, laneIndex);
+                    entry.fromX = dotX;
+                    entry.fromOrigin = "dot";
+                }
             }
         });
 
-        const startX = (entry) => entry.fromX ?? laneDrawX(entry.laneIndex);
-        const endX = (entry) => entry.toX ?? laneDrawX(entry.laneIndex);
+        // fold された遷移では branch / merge のイベントが片方しか無くても、
+        // 隣行のドットがもう片方の端点になる。行上に実在するドットまたは
+        // 通過線から座標を解決し、上側境界のカーブ分割点を起点に混ぜない。
+        for (const entry of transitions.values()) {
+            const top = rows[entry.topRow];
+            const bottom = rows[entry.topRow + 1];
+            if (entry.fromOrigin === null) {
+                entry.fromOrigin = top.lane === entry.laneIndex ? "dot" : "pass";
+                entry.fromX = entry.fromOrigin === "dot" ? laneDrawX(top.lane) : laneDrawX(entry.laneIndex);
+            }
+            if (entry.toOrigin === null) {
+                entry.toOrigin = bottom.lane === entry.laneIndex ? "dot" : "pass";
+                entry.toX = entry.toOrigin === "dot" ? laneDrawX(bottom.lane) : laneDrawX(entry.laneIndex);
+            }
+
+            if (entry.fromOrigin === "dot" && entry.toOrigin === "dot") entry.type = "dot-to-dot";
+            else if (entry.fromOrigin === "dot") entry.type = "branch";
+            else entry.type = "merge";
+        }
+
+        const startX = (entry) => entry.fromX;
+        const endX = (entry) => entry.toX;
 
         // 遷移が占める半セルでは、そのレーンの縦線を描かない
         const asTop = rows.map(() => []);
@@ -1328,11 +1364,12 @@ html.gl-dark .glg-root {
         for (const entry of transitions.values()) {
             asTop[entry.topRow].push(entry);
             asBottom[entry.topRow + 1].push(entry);
-            suppressLower[entry.topRow].add(entry.laneIndex);
-            suppressUpper[entry.topRow + 1].add(entry.laneIndex);
-            if (entry.topRow === detailBoundaryIndex && entry.fromX === null) {
-                suppressUpper[entry.topRow].add(entry.laneIndex);
+            // パネル境界の合流は、消滅する出発元レーンを上側の行でそのまま
+            // 下端まで通し、合流カーブだけを下側の行へ遅らせる。
+            if (entry.topRow !== detailBoundaryIndex || entry.type !== "merge") {
+                suppressLower[entry.topRow].add(entry.laneIndex);
             }
+            suppressUpper[entry.topRow + 1].add(entry.laneIndex);
         }
 
         rows.forEach((row, index) => {
@@ -1361,15 +1398,37 @@ html.gl-dark .glg-root {
             addLane(row.lane, laneDrawX(row.lane), row.hasTop, row.hasBottom);
 
             for (const entry of asTop[index]) {
-                const d =
-                    index === detailBoundaryIndex
-                        ? halfRowPath(startX(entry), entry.fromX === null ? 0 : HALF_ROW, endX(entry), ROW_HEIGHT)
-                        : transitionUpperPath(startX(entry), endX(entry));
+                let d;
+                if (index !== detailBoundaryIndex) {
+                    d = transitionUpperPath(startX(entry), endX(entry));
+                } else if (entry.type === "branch") {
+                    d = halfRowPath(startX(entry), HALF_ROW, endX(entry), ROW_HEIGHT);
+                } else if (entry.type === "merge") {
+                    // 出発元の通過線は標準の縦線描画に任せる。
+                    continue;
+                } else {
+                    // dot-to-dot は上側のドットのレーンをガターまで直進させる。
+                    // 同じドットから続く別経路と x が一致しても、経路数を失わないよう別要素で残す。
+                    verticals.push({
+                        x: startX(entry),
+                        y1: HALF_ROW,
+                        y2: ROW_HEIGHT,
+                        color: laneColor(entry.laneIndex),
+                    });
+                    continue;
+                }
                 curves.push({ d, color: laneColor(entry.laneIndex) });
             }
             for (const entry of asBottom[index]) {
                 if (entry.topRow === detailBoundaryIndex) {
-                    pushVertical(endX(entry), 0, HALF_ROW, laneColor(entry.laneIndex));
+                    if (entry.type === "branch") {
+                        pushVertical(endX(entry), 0, HALF_ROW, laneColor(entry.laneIndex));
+                    } else {
+                        curves.push({
+                            d: halfRowPath(startX(entry), 0, endX(entry), HALF_ROW),
+                            color: laneColor(entry.laneIndex),
+                        });
+                    }
                 } else {
                     curves.push({ d: transitionLowerPath(startX(entry), endX(entry)), color: laneColor(entry.laneIndex) });
                 }
@@ -1395,26 +1454,32 @@ html.gl-dark .glg-root {
             }
 
             // 詳細パネル行に引き伸ばす縦線。この行の下端境界を通過する全レーンを描く。
-            // 通常は遷移の分割点へ繋ぎ、パネルを挟む境界だけは上の行で遷移を完了した行き先へ繋ぐ。
+            // 通常は遷移の分割点へ繋ぐ。パネル境界では分岐だけを行き先へ通し、
+            // 合流系は既存レーンとの重複を避けるため排他的な出発元へ通す。
             const detailXByLane = new Map();
             for (const entry of asTop[index]) {
                 detailXByLane.set(
                     entry.laneIndex,
-                    index === detailBoundaryIndex ? endX(entry) : (startX(entry) + endX(entry)) / 2,
+                    index === detailBoundaryIndex
+                        ? entry.type === "branch"
+                            ? endX(entry)
+                            : startX(entry)
+                        : (startX(entry) + endX(entry)) / 2,
                 );
             }
             const detailLanes = [];
             const detailDrawn = new Set();
             for (const laneIndex of row.activeAfter) {
                 const transitionX = detailXByLane.get(laneIndex);
-                if (transitionX !== undefined && index !== detailBoundaryIndex) {
+                if (transitionX !== undefined) {
                     // 分割点は隣のレーンの中心と一致することがある (レーン 0 -> 2 の中点 = レーン 1 の中心)。
-                    // x で重複除外すると通過レーンの線が消えるので、遷移中のレーンは必ず描く
+                    // パネル境界でも x0/x1 が別経路と一致し得る。x で重複除外すると遷移本数が
+                    // 減るため、遷移中のレーンは常に別要素として描く。
                     detailLanes.push({ x: transitionX, color: laneColor(laneIndex) });
                     continue;
                 }
                 const x = transitionX ?? laneDrawX(laneIndex);
-                // パネル境界で同じ行き先へ合流した線と、切り詰めで同じ x に潰れた線は 1 本にまとめる
+                // 切り詰めで同じ x に潰れた通常レーン同士は 1 本にまとめる。
                 if (detailDrawn.has(x)) continue;
                 detailDrawn.add(x);
                 detailLanes.push({ x, color: laneColor(laneIndex) });

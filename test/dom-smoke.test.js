@@ -1086,3 +1086,155 @@ test("dom-smoke 108: moving detail to a non-transition boundary restores the old
     assert.strictEqual(env.document.querySelector('.glg-row[data-glg-sha="otherParent"] .glg-cell-graph').innerHTML, otherBefore);
     env.dom.window.close();
 });
+
+const pathNumbers = (path) => (path.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number);
+const coordinateMultiset = (values) => values.map((value) => Number(value).toFixed(6)).sort();
+
+const rowEdgeXs = (env, sha, edge) => {
+    const row = env.document.querySelector(`.glg-row[data-glg-sha="${sha}"]`);
+    const values = [];
+    for (const line of row.querySelectorAll("line")) {
+        const y = Number(line.getAttribute(edge === "top" ? "y1" : "y2"));
+        if (y === (edge === "top" ? 0 : env.api.ROW_HEIGHT)) values.push(Number(line.getAttribute("x1")));
+    }
+    for (const path of row.querySelectorAll("path")) {
+        const points = pathNumbers(path.getAttribute("d"));
+        if (edge === "top" && points[1] === 0) values.push(points[0]);
+        if (edge === "bottom" && points[7] === env.api.ROW_HEIGHT) values.push(points[6]);
+    }
+    return coordinateMultiset(values);
+};
+
+const gutterXs = (env) =>
+    coordinateMultiset(
+        [...env.document.querySelectorAll(".glg-detail-row rect")].map(
+            (rect) => Number(rect.getAttribute("x")) + Number(rect.getAttribute("width")) / 2,
+        ),
+    );
+
+let foldedBoundaryPromise;
+const foldedBoundary = () => {
+    if (!foldedBoundaryPromise) {
+        const fixture = {
+            project: { default_branch: "main" },
+            branches: [
+                { name: "main", default: true, commit: { id: "merge" } },
+                { name: "other", default: false, commit: { id: "otherTip" } },
+            ],
+            tags: [],
+            commits: [
+                rawCommit("otherTip", ["otherParent"], 10),
+                rawCommit("merge", ["main", "tip"], 9),
+                rawCommit("tip", ["main"], 8),
+                rawCommit("main", ["root"], 7),
+                rawCommit("otherParent", ["root"], 2),
+                rawCommit("root", [], 1),
+            ],
+        };
+        foldedBoundaryPromise = createDom({ fixture });
+    }
+    return foldedBoundaryPromise;
+};
+
+test("dom-smoke 109: dot-to-dot uses its upper dot lane and completes below the detail gutter", async () => {
+    const env = await foldedBoundary();
+    const row = env.api.state.rowsBySha.get("tip");
+    const index = env.api.state.graphRows.indexOf(row);
+    const next = env.api.state.graphRows[index + 1];
+    const x0 = env.api.laneDrawX(row.lane);
+    const x1 = env.api.laneDrawX(next.lane);
+
+    env.document.querySelector('.glg-row[data-glg-sha="tip"]').click();
+    await waitFor(() => env.api.state.expandedSha === "tip" && env.document.querySelector(".glg-detail-row"), "folded detail row");
+
+    assert.ok(
+        [...env.document.querySelectorAll('.glg-row[data-glg-sha="tip"] line')].some(
+            (line) =>
+                Number(line.getAttribute("x1")) === x0 &&
+                Number(line.getAttribute("x2")) === x0 &&
+                Number(line.getAttribute("y1")) === env.api.HALF_ROW &&
+                Number(line.getAttribute("y2")) === env.api.ROW_HEIGHT,
+        ),
+    );
+    assert.ok(!graphPaths(env, "tip").includes(env.api.halfRowPath(x0, env.api.HALF_ROW, x1, env.api.ROW_HEIGHT)));
+    assert.ok(gutterXs(env).includes(Number(x0).toFixed(6)));
+    assert.ok(graphPaths(env, "main").includes(env.api.halfRowPath(x0, 0, x1, env.api.HALF_ROW)));
+
+    env.document.querySelector('.glg-row[data-glg-sha="tip"]').click();
+    assert.strictEqual(env.document.querySelector(".glg-detail-row"), null);
+    assert.ok(graphPaths(env, "tip").includes(env.api.transitionUpperPath(x0, x1)));
+    assert.ok(graphPaths(env, "main").includes(env.api.transitionLowerPath(x0, x1)));
+});
+
+test("dom-smoke 110: merge lanes stay distinct in the gutter and complete only in the lower row", async () => {
+    const env = await createDom({
+        fixture: {
+            project: { default_branch: "main" },
+            branches: [
+                { name: "main", default: true, commit: { id: "merge" } },
+                { name: "other", default: false, commit: { id: "otherTip" } },
+            ],
+            tags: [],
+            commits: [
+                rawCommit("otherTip", ["otherParent"], 10),
+                rawCommit("merge", ["mainParent", "sideParent"], 9),
+                rawCommit("mainParent", ["root"], 8),
+                rawCommit("sideParent", ["root"], 7),
+                rawCommit("otherParent", ["root"], 1),
+                rawCommit("root", [], 0),
+            ],
+        },
+    });
+    const row = env.api.state.rowsBySha.get("otherParent");
+    const index = env.api.state.graphRows.indexOf(row);
+    const next = env.api.state.graphRows[index + 1];
+    const dotToDotX = env.api.laneDrawX(row.lane);
+    const mergeLane = next.merges.find((lane) => lane !== row.lane);
+    assert.notStrictEqual(mergeLane, undefined);
+    const mergeX0 = env.api.laneDrawX(mergeLane);
+    const mergeX1 = env.api.laneDrawX(next.lane);
+
+    env.document.querySelector('.glg-row[data-glg-sha="otherParent"]').click();
+    await waitFor(
+        () => env.api.state.expandedSha === "otherParent" && env.document.querySelector(".glg-detail-row"),
+        "merge detail row",
+    );
+
+    const gutter = gutterXs(env);
+    assert.strictEqual(new Set(gutter).size, gutter.length, "unclipped gutter lanes must not overlap");
+    assert.ok(gutter.includes(Number(dotToDotX).toFixed(6)));
+    assert.ok(gutter.includes(Number(mergeX0).toFixed(6)));
+    assert.ok(
+        [...env.document.querySelectorAll('.glg-row[data-glg-sha="otherParent"] line')].some(
+            (line) =>
+                Number(line.getAttribute("x1")) === mergeX0 &&
+                Number(line.getAttribute("x2")) === mergeX0 &&
+                Number(line.getAttribute("y1")) === 0 &&
+                Number(line.getAttribute("y2")) === env.api.ROW_HEIGHT,
+        ),
+        "the upper row must retain the merging pass lane as a full-height vertical",
+    );
+    assert.ok(graphPaths(env, "root").includes(env.api.halfRowPath(mergeX0, 0, mergeX1, env.api.HALF_ROW)));
+    assert.ok(
+        !graphPaths(env, "otherParent").includes(env.api.halfRowPath(mergeX0, 0, mergeX1, env.api.ROW_HEIGHT)),
+        "the upper row must not contain a full-row merge completion curve",
+    );
+    await waitFor(() => env.api.state.detailCache.has("otherParent"), "merge detail payload");
+    env.dom.window.close();
+});
+
+test("dom-smoke 111: expanding every fixture row preserves edge multiplicity through the gutter", async () => {
+    const env = await foldedBoundary();
+    const rows = env.api.state.graphRows;
+    for (let index = 0; index + 1 < rows.length; index += 1) {
+        env.document.querySelector(`.glg-row[data-glg-sha="${rows[index].sha}"]`).click();
+        await waitFor(
+            () => env.api.state.expandedSha === rows[index].sha && env.document.querySelector(".glg-detail-row"),
+            `detail row ${rows[index].sha}`,
+        );
+        assert.deepStrictEqual(rowEdgeXs(env, rows[index].sha, "bottom"), gutterXs(env), `upper/gutter ${rows[index].sha}`);
+        assert.deepStrictEqual(gutterXs(env), rowEdgeXs(env, rows[index + 1].sha, "top"), `gutter/lower ${rows[index].sha}`);
+    }
+    await waitFor(() => env.api.state.detailCache.has(rows.at(-2).sha), "final swept detail payload");
+    env.dom.window.close();
+});

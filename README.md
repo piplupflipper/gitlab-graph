@@ -468,4 +468,4 @@ CSS は `<style>` で注入し、class 名は `glg-` で始める。🏷️
 ---
 
 リポジトリ: [ngmtine/gitlab-graph](https://github.com/ngmtine/gitlab-graph)
-本 README の記述は 2026-08-02 時点の gitlab.com と gitlab-graph 0.2.1 に基づく。
+本 README の記述は 2026-08-02 時点の gitlab.com と gitlab-graph 0.2.2 に基づく。
