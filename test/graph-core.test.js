@@ -112,7 +112,13 @@ test("graph-core 12: cyclic data terminates promptly", () => {
 
 test("graph-core 13: cyclic data still emits every commit", () => {
     const ordered = api.topoSortCommits([commit("a", ["b"], 1), commit("b", ["a"], 2)]);
-    assert.strictEqual(ordered.map((item) => item.sha).sort().join(","), "a,b");
+    assert.strictEqual(
+        ordered
+            .map((item) => item.sha)
+            .sort()
+            .join(","),
+        "a,b",
+    );
 });
 
 test("graph-core 14: joined descending/ascending windows remain topological", () => {
@@ -124,8 +130,14 @@ test("graph-core 14: joined descending/ascending windows remain topological", ()
 test("graph-core 15: window-joined and shuffled inputs produce the same order", () => {
     const dag = syntheticDag();
     const joined = [...dag.slice(6).reverse(), ...dag.slice(0, 6)];
-    const a = api.topoSortCommits(joined).map((item) => item.sha).join(",");
-    const b = api.topoSortCommits(shuffle(dag, 99)).map((item) => item.sha).join(",");
+    const a = api
+        .topoSortCommits(joined)
+        .map((item) => item.sha)
+        .join(",");
+    const b = api
+        .topoSortCommits(shuffle(dag, 99))
+        .map((item) => item.sha)
+        .join(",");
     assert.strictEqual(a, b);
 });
 
@@ -189,7 +201,13 @@ const consecutiveMerges = () => [
 test("graph-core 21: three consecutive merge commits remain on one lane", () => {
     const ordered = api.topoSortCommits(consecutiveMerges());
     const rows = api.assignLanes(ordered, api.collectMainline(ordered, "m3")).rows;
-    assert.strictEqual(rows.filter((row) => /^m/.test(row.sha)).map((row) => row.lane).join(","), "0,0,0");
+    assert.strictEqual(
+        rows
+            .filter((row) => /^m/.test(row.sha))
+            .map((row) => row.lane)
+            .join(","),
+        "0,0,0",
+    );
 });
 
 test("graph-core 22: each second parent ends by merging into a commit dot", () => {
@@ -197,7 +215,10 @@ test("graph-core 22: each second parent ends by merging into a commit dot", () =
     const rows = api.assignLanes(ordered, api.collectMainline(ordered, "m3")).rows;
     const secondParentLanes = ["s1", "s2", "s3"].map((sha) => rows.find((entry) => entry.sha === sha).lane);
     const root = rows.find((entry) => entry.sha === "r");
-    assert.deepStrictEqual([...root.merges].sort((a, b) => a - b), secondParentLanes.sort((a, b) => a - b));
+    assert.deepStrictEqual(
+        [...root.merges].sort((a, b) => a - b),
+        secondParentLanes.sort((a, b) => a - b),
+    );
 });
 
 test("graph-core 23: a short-lived branch spans out and back without breaking continuity", () => {

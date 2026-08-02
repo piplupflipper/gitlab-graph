@@ -14,5 +14,6 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      - run: npx biome ci .
       - run: node --check gitlab-graph.user.js
       - run: npm test

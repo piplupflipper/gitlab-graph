@@ -131,7 +131,7 @@ const createDom = async (options = {}) => {
     const fixture = options.fixture ?? defaultFixture();
     const html =
         options.html ??
-        "<!doctype html><html><head></head><body><main class=\"container-limited\"><div class=\"row-content-block\"><div id=\"js-graph-ref-switcher\"></div><p>Native explanation</p></div><div class=\"project-network\"><div class=\"network-graph\">native graph</div></div></main></body></html>";
+        '<!doctype html><html><head></head><body><main class="container-limited"><div class="row-content-block"><div id="js-graph-ref-switcher"></div><p>Native explanation</p></div><div class="project-network"><div class="network-graph">native graph</div></div></main></body></html>';
     const dom = new JSDOM(html, {
         url: options.url ?? "https://gitlab.example/grp/sub/prj/-/network/main",
         runScripts: "outside-only",

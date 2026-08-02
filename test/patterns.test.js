@@ -72,7 +72,15 @@ const assertGraphInvariants = (result) => {
 
 const octopus = (parentCount) => {
     const roots = Array.from({ length: parentCount }, (_, index) => commit(`p${index}`, ["root"], 10 - index));
-    return [commit("merge", roots.map((item) => item.sha), 20), ...roots, commit("root", [], 1)];
+    return [
+        commit(
+            "merge",
+            roots.map((item) => item.sha),
+            20,
+        ),
+        ...roots,
+        commit("root", [], 1),
+    ];
 };
 
 test("patterns 01: three-parent octopus has two distinct branch transitions", () => {
@@ -129,13 +137,7 @@ test("patterns 06: two-round criss-cross merge stays topological and connected",
 });
 
 test("patterns 07: branch and immediate merge completes a one-row out-and-back span", () => {
-    const values = [
-        commit("merge", ["main", "side"], 5),
-        commit("side", ["fork"], 4),
-        commit("main", ["fork"], 3),
-        commit("fork", ["root"], 2),
-        commit("root", [], 1),
-    ];
+    const values = [commit("merge", ["main", "side"], 5), commit("side", ["fork"], 4), commit("main", ["fork"], 3), commit("fork", ["root"], 2), commit("root", [], 1)];
     const result = graph(values, "merge");
     assert.ok(result.rows.some((row) => row.branches.length === 1));
     assert.ok(result.rows.some((row) => row.merges.length === 1));

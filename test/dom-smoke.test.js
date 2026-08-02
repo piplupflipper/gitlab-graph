@@ -2,22 +2,10 @@
 
 const assert = require("node:assert");
 const { test } = require("./framework");
-const {
-    createDom,
-    createFetchStub,
-    defaultFixture,
-    dispatchKey,
-    loadCore,
-    rawCommit,
-    response,
-    source,
-    tick,
-    waitFor,
-} = require("./helpers");
+const { createDom, defaultFixture, dispatchKey, loadCore, rawCommit, response, source, tick, waitFor } = require("./helpers");
 
 const commitCalls = (env) => env.fetch.calls.filter((call) => call.url.pathname.endsWith("/repository/commits"));
-const detailCalls = (env) =>
-    env.fetch.calls.filter((call) => /\/repository\/commits\/[^/]+(?:\/diff)?$/.test(call.url.pathname));
+const detailCalls = (env) => env.fetch.calls.filter((call) => /\/repository\/commits\/[^/]+(?:\/diff)?$/.test(call.url.pathname));
 
 let basePromise;
 const base = () => {
@@ -62,7 +50,7 @@ test("dom-smoke 06: percent-encoded slash in ref is decoded as one ref name", ()
 test("dom-smoke 07: non-network pages leave the DOM untouched", async () => {
     const env = await createDom({
         url: "https://gitlab.example/grp/sub/prj/-/commits/main",
-        html: "<!doctype html><html><head></head><body><div class=\"project-network\">sentinel</div></body></html>",
+        html: '<!doctype html><html><head></head><body><div class="project-network">sentinel</div></body></html>',
         waitForUi: false,
     });
     await tick();
@@ -295,12 +283,22 @@ const refEnv = async () => {
 
 test("dom-smoke 35: confirmed branch switches commits API to ref_name mode", async () => {
     const env = await refEnv();
-    assert.ok(commitCalls(env).filter((call) => call.url.searchParams.has("ref_name")).every((call) => call.url.searchParams.get("ref_name") === "dev"));
+    assert.ok(
+        commitCalls(env)
+            .filter((call) => call.url.searchParams.has("ref_name"))
+            .every((call) => call.url.searchParams.get("ref_name") === "dev"),
+    );
 });
 
 test("dom-smoke 36: ref mode requests pages 1, 2, and 3", async () => {
     const env = await refEnv();
-    assert.strictEqual(commitCalls(env).filter((call) => call.url.searchParams.has("ref_name")).map((call) => call.url.searchParams.get("page")).join(","), "1,2,3");
+    assert.strictEqual(
+        commitCalls(env)
+            .filter((call) => call.url.searchParams.has("ref_name"))
+            .map((call) => call.url.searchParams.get("page"))
+            .join(","),
+        "1,2,3",
+    );
 });
 
 test("dom-smoke 37: ref mode performs exactly three initial page requests", async () => {
@@ -882,9 +880,7 @@ test("dom-smoke 100: complete two-page branch refs keep page-two commits and fil
         commits: [rawCommit("main0000", [], 3), rawCommit("late0000", [], 2), rawCommit("phantom0", [], 1)],
     };
     const env = await createDom({ fixture });
-    const pages = env.fetch.calls
-        .filter((call) => call.url.pathname.endsWith("/repository/branches") && !call.url.searchParams.has("search"))
-        .map((call) => call.url.searchParams.get("page"));
+    const pages = env.fetch.calls.filter((call) => call.url.pathname.endsWith("/repository/branches") && !call.url.searchParams.has("search")).map((call) => call.url.searchParams.get("page"));
     assert.deepStrictEqual(pages, ["1", "2"]);
     assert.strictEqual(env.api.state.refsComplete, true);
     assert.ok(env.document.querySelector('.glg-row[data-glg-sha="late0000"]'));
@@ -930,10 +926,7 @@ test("dom-smoke 102: a branches API failure fails open and identifies refs as th
         branches,
         tags: [],
         commits: [rawCommit("main0000", [], 2), rawCommit("phantom0", [], 1)],
-        fetch: (url) =>
-            url.pathname.endsWith("/repository/branches") && url.searchParams.get("page") === "2"
-                ? response({}, 500)
-                : undefined,
+        fetch: (url) => (url.pathname.endsWith("/repository/branches") && url.searchParams.get("page") === "2" ? response({}, 500) : undefined),
     };
     const env = await createDom({ fixture });
     assert.strictEqual(env.api.state.refsComplete, false);
@@ -1017,8 +1010,7 @@ const detailBoundary = () => {
     return detailBoundaryPromise;
 };
 
-const graphPaths = (env, sha) =>
-    [...env.document.querySelectorAll(`.glg-row[data-glg-sha="${sha}"] path`)].map((node) => node.getAttribute("d"));
+const graphPaths = (env, sha) => [...env.document.querySelectorAll(`.glg-row[data-glg-sha="${sha}"] path`)].map((node) => node.getAttribute("d"));
 
 test("dom-smoke 105: detail gutter moves a colliding lane 0-to-2 midpoint onto distinct lane centers", async () => {
     const env = await detailBoundary();
@@ -1031,9 +1023,7 @@ test("dom-smoke 105: detail gutter moves a colliding lane 0-to-2 midpoint onto d
     env.document.querySelector('.glg-row[data-glg-sha="merge"]').click();
     await waitFor(() => env.api.state.expandedSha === "merge" && env.document.querySelector(".glg-detail-row"), "collision detail row");
 
-    const centers = [...env.document.querySelectorAll(".glg-detail-row rect")].map(
-        (rect) => Number(rect.getAttribute("x")) + Number(rect.getAttribute("width")) / 2,
-    );
+    const centers = [...env.document.querySelectorAll(".glg-detail-row rect")].map((rect) => Number(rect.getAttribute("x")) + Number(rect.getAttribute("width")) / 2);
     assert.deepStrictEqual(centers, [env.api.laneDrawX(0), env.api.laneDrawX(1), env.api.laneDrawX(2)]);
     assert.strictEqual(new Set(centers).size, centers.length);
 });
@@ -1046,11 +1036,7 @@ test("dom-smoke 106: detail boundary completes the curve above and enters below 
     assert.ok(!graphPaths(env, "mainParent").includes(env.api.transitionLowerPath(x0, x1)));
 
     const entrance = [...env.document.querySelectorAll('.glg-row[data-glg-sha="mainParent"] line')].find(
-        (line) =>
-            Number(line.getAttribute("x1")) === x1 &&
-            Number(line.getAttribute("x2")) === x1 &&
-            Number(line.getAttribute("y1")) === 0 &&
-            Number(line.getAttribute("y2")) === env.api.HALF_ROW,
+        (line) => Number(line.getAttribute("x1")) === x1 && Number(line.getAttribute("x2")) === x1 && Number(line.getAttribute("y1")) === 0 && Number(line.getAttribute("y2")) === env.api.HALF_ROW,
     );
     assert.ok(entrance);
 });
@@ -1076,10 +1062,7 @@ test("dom-smoke 108: moving detail to a non-transition boundary restores the old
 
     env.document.querySelector('.glg-row[data-glg-sha="merge"]').click();
     env.document.querySelector('.glg-row[data-glg-sha="sideParent"]').click();
-    await waitFor(
-        () => env.api.state.expandedSha === "sideParent" && env.api.state.detailCache.has("sideParent"),
-        "moved detail payload",
-    );
+    await waitFor(() => env.api.state.expandedSha === "sideParent" && env.api.state.detailCache.has("sideParent"), "moved detail payload");
 
     assert.strictEqual(env.api.state.detailBoundaryIndex, -1);
     assert.ok(graphPaths(env, "merge").includes(env.api.transitionUpperPath(x0, x1)));
@@ -1107,12 +1090,7 @@ const rowEdgeXs = (env, sha, edge) => {
     return coordinateMultiset(values);
 };
 
-const gutterXs = (env) =>
-    coordinateMultiset(
-        [...env.document.querySelectorAll(".glg-detail-row rect")].map(
-            (rect) => Number(rect.getAttribute("x")) + Number(rect.getAttribute("width")) / 2,
-        ),
-    );
+const gutterXs = (env) => coordinateMultiset([...env.document.querySelectorAll(".glg-detail-row rect")].map((rect) => Number(rect.getAttribute("x")) + Number(rect.getAttribute("width")) / 2));
 
 let foldedBoundaryPromise;
 const foldedBoundary = () => {
@@ -1197,10 +1175,7 @@ test("dom-smoke 110: merge lanes stay distinct in the gutter and complete only i
     const mergeX1 = env.api.laneDrawX(next.lane);
 
     env.document.querySelector('.glg-row[data-glg-sha="otherParent"]').click();
-    await waitFor(
-        () => env.api.state.expandedSha === "otherParent" && env.document.querySelector(".glg-detail-row"),
-        "merge detail row",
-    );
+    await waitFor(() => env.api.state.expandedSha === "otherParent" && env.document.querySelector(".glg-detail-row"), "merge detail row");
 
     const gutter = gutterXs(env);
     assert.strictEqual(new Set(gutter).size, gutter.length, "unclipped gutter lanes must not overlap");
@@ -1217,10 +1192,7 @@ test("dom-smoke 110: merge lanes stay distinct in the gutter and complete only i
         "the upper row must retain the merging pass lane as a full-height vertical",
     );
     assert.ok(graphPaths(env, "root").includes(env.api.halfRowPath(mergeX0, 0, mergeX1, env.api.HALF_ROW)));
-    assert.ok(
-        !graphPaths(env, "otherParent").includes(env.api.halfRowPath(mergeX0, 0, mergeX1, env.api.ROW_HEIGHT)),
-        "the upper row must not contain a full-row merge completion curve",
-    );
+    assert.ok(!graphPaths(env, "otherParent").includes(env.api.halfRowPath(mergeX0, 0, mergeX1, env.api.ROW_HEIGHT)), "the upper row must not contain a full-row merge completion curve");
     await waitFor(() => env.api.state.detailCache.has("otherParent"), "merge detail payload");
     env.dom.window.close();
 });
@@ -1230,10 +1202,7 @@ test("dom-smoke 111: expanding every fixture row preserves edge multiplicity thr
     const rows = env.api.state.graphRows;
     for (let index = 0; index + 1 < rows.length; index += 1) {
         env.document.querySelector(`.glg-row[data-glg-sha="${rows[index].sha}"]`).click();
-        await waitFor(
-            () => env.api.state.expandedSha === rows[index].sha && env.document.querySelector(".glg-detail-row"),
-            `detail row ${rows[index].sha}`,
-        );
+        await waitFor(() => env.api.state.expandedSha === rows[index].sha && env.document.querySelector(".glg-detail-row"), `detail row ${rows[index].sha}`);
         assert.deepStrictEqual(rowEdgeXs(env, rows[index].sha, "bottom"), gutterXs(env), `upper/gutter ${rows[index].sha}`);
         assert.deepStrictEqual(gutterXs(env), rowEdgeXs(env, rows[index + 1].sha, "top"), `gutter/lower ${rows[index].sha}`);
     }
